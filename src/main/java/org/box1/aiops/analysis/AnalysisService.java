@@ -1,0 +1,225 @@
+package org.box1.aiops.analysis;
+
+import java.security.SecureRandom;
+import java.time.Clock;
+import java.util.ArrayList;
+import java.util.HexFormat;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Set;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
+
+import jakarta.annotation.PreDestroy;
+import jakarta.enterprise.context.ApplicationScoped;
+import jakarta.inject.Inject;
+
+import org.box1.aiops.AiopsConfig;
+import org.box1.aiops.Ids;
+import org.box1.aiops.NotFound;
+import org.box1.aiops.evidence.EvidenceItem;
+import org.box1.aiops.evidence.EvidenceService;
+import org.box1.aiops.evidence.Fetch;
+import org.box1.aiops.evidence.Upstreams;
+import org.box1.aiops.model.ModelClient;
+import org.box1.aiops.model.ModelRequest;
+import org.box1.aiops.model.ModelResult;
+import org.box1.aiops.security.Guard;
+
+import com.fasterxml.jackson.databind.ObjectMapper;
+
+import io.micrometer.core.instrument.Gauge;
+import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.Timer;
+import io.quarkus.logging.Log;
+
+/**
+ * Bounded, evidence-grounded analysis (D-002 to D-011). Submission authorizes the caller, resolves the incident and
+ * queues the work; a fixed-size worker pool then gathers evidence, calls the model once and validates the answer.
+ * Nothing here can execute an action.
+ */
+@io.quarkus.runtime.Startup
+@ApplicationScoped
+public class AnalysisService {
+    private static final SecureRandom RANDOM = new SecureRandom();
+    /** Read failures of an expected source. Service-declared gaps (UNAVAILABLE) do not degrade an analysis. */
+    static final Set<String> DEGRADING = Set.of("NOT_FOUND", "UNAUTHORIZED", "ERROR", "TIMEOUT", "UNREACHABLE");
+
+    private final Guard guard;
+    private final Upstreams upstreams;
+    private final EvidenceService evidence;
+    private final ModelClient model;
+    private final ObjectMapper json;
+    private final AiopsConfig config;
+    private final MeterRegistry registry;
+    private final AnalysisStore store;
+    private final ThreadPoolExecutor workers;
+    private final Clock clock = Clock.systemUTC();
+
+    @Inject
+    public AnalysisService(Guard guard, Upstreams upstreams, EvidenceService evidence, ModelClient model,
+            ObjectMapper json, AiopsConfig config, MeterRegistry registry) {
+        this.guard = guard;
+        this.upstreams = upstreams;
+        this.evidence = evidence;
+        this.model = model;
+        this.json = json;
+        this.config = config;
+        this.registry = registry;
+        AiopsConfig.Analysis a = config.analysis();
+        this.store = new AnalysisStore(clock, a.ttl(), a.maxEntries());
+        this.workers = new ThreadPoolExecutor(a.concurrency(), a.concurrency(), 60, TimeUnit.SECONDS,
+            new ArrayBlockingQueue<>(Math.max(1, a.queueBound())), r -> {
+                Thread t = new Thread(r, "aiops-analysis");
+                t.setDaemon(true);
+                return t;
+            }, new ThreadPoolExecutor.AbortPolicy());
+        Gauge.builder("aiops_queue_depth", workers, w -> w.getQueue().size())
+            .description("Analyses waiting for the model").register(registry);
+    }
+
+    @PreDestroy
+    void stop() {
+        workers.shutdownNow();
+    }
+
+    /** Authorizes, resolves the incident and queues the analysis. Unknown orders never reach the model. */
+    public Analysis submit(String incidentId) {
+        guard.requireAnalyst();
+        String orderId = Ids.orderOfIncident(incidentId);
+        Fetch order = upstreams.order(orderId);
+        if (order.status() == Fetch.Status.NOT_FOUND) {
+            throw new NotFound("INCIDENT_NOT_FOUND", "no order " + orderId + " for incident " + incidentId);
+        }
+        String id = "ana_" + HexFormat.of().formatHex(bytes());
+        Analysis queued = Analysis.queued(id, incidentId, orderId, clock.instant());
+        String subject = guard.subject();
+        store.put(queued, subject);
+        try {
+            workers.execute(() -> run(queued, subject));
+        } catch (RejectedExecutionException e) {
+            store.remove(id);
+            registry.counter("aiops_analyses_total", "status", "BUSY").increment();
+            throw new Busy("analysis queue is full; retry later");
+        }
+        Log.infof("analysis queued analysisId=%s incidentId=%s subject=%s", id, incidentId, subject);
+        return queued;
+    }
+
+    public Analysis get(String analysisId) {
+        guard.requireViewer();
+        Ids.analysis(analysisId);
+        return store.get(analysisId).orElseThrow(() -> new NotFound("ANALYSIS_NOT_FOUND",
+            "no analysis " + analysisId + "; analyses are kept in memory for " + config.analysis().ttl()
+                + " and do not survive a restart"));
+    }
+
+    private void run(Analysis queued, String subject) {
+        Timer.Sample sample = Timer.start(registry);
+        Analysis result;
+        try {
+            store.put(queued.running(), subject);
+            result = analyze(queued);
+        } catch (RuntimeException e) {
+            Log.errorf("analysis %s failed: %s", queued.analysisId(), e.getClass().getSimpleName());
+            result = finish(queued, null, Analysis.Status.FAILED, "internal error", List.of(), null, null, null);
+        }
+        store.put(result, subject);
+        sample.stop(registry.timer("aiops_analysis_duration_seconds", "status", result.status().name()));
+        registry.counter("aiops_analyses_total", "status", result.status().name()).increment();
+        Log.infof("analysis finished analysisId=%s status=%s", result.analysisId(), result.status());
+    }
+
+    private Analysis analyze(Analysis queued) {
+        Profile profile = Profile.of(config.model().contextProfile());
+        EvidenceService.Bundle bundle = evidence.gather(queued.orderId(), profile.evidenceBytes());
+        List<EvidenceItem> items = bundle.items();
+        String type = IncidentRules.derive(bundle.order(), config.analysis().stuckThreshold(), clock.instant());
+        Analysis typed = new Analysis(queued.analysisId(), queued.incidentId(), queued.orderId(), type,
+            Analysis.Status.RUNNING, null, queued.createdAt(), null, null, List.of(), List.of(), List.of(), items,
+            null, null);
+        if (bundle.order() == null) {
+            return finish(typed, items, Analysis.Status.DEGRADED,
+                "order evidence unavailable (" + bundle.orderStatus() + "); no analysis was attempted",
+                serviceUnknowns(items), null, null, null);
+        }
+        ModelRequest request = new ModelRequest(Prompt.SYSTEM,
+            Prompt.user(json, queued.incidentId(), type, queued.orderId(), items), Prompt.schema(json),
+            profile.maxOutputTokens());
+        ModelResult answer = model.complete(request);
+        Analysis.ModelInfo info = new Analysis.ModelInfo(model.modelId(), profile.name(), answer.promptTokens(),
+            answer.completionTokens());
+        if (answer.promptTokens() != null) {
+            registry.counter("aiops_model_tokens_total", "kind", "prompt").increment(answer.promptTokens());
+        }
+        if (answer.completionTokens() != null) {
+            registry.counter("aiops_model_tokens_total", "kind", "completion").increment(answer.completionTokens());
+        }
+        Log.infof("model call analysisId=%s outcome=%s promptTokens=%s completionTokens=%s profile=%s",
+            queued.analysisId(), answer.outcome(), answer.promptTokens(), answer.completionTokens(), profile.name());
+        switch (answer.outcome()) {
+            case UNAVAILABLE, TIMEOUT -> {
+                return finish(typed, items, Analysis.Status.MODEL_UNAVAILABLE, answer.detail(), serviceUnknowns(items),
+                    info, null, null);
+            }
+            case INVALID -> {
+                return finish(typed, items, Analysis.Status.MODEL_INVALID_OUTPUT, answer.detail(),
+                    serviceUnknowns(items), info, null, null);
+            }
+            default -> {
+            }
+        }
+        Set<String> refs = new HashSet<>();
+        items.forEach(i -> refs.add(i.ref()));
+        OutputValidator.Validated v;
+        try {
+            v = OutputValidator.validate(json, answer.content(), refs);
+        } catch (OutputValidator.Invalid e) {
+            return finish(typed, items, Analysis.Status.MODEL_INVALID_OUTPUT, e.getMessage(), serviceUnknowns(items),
+                info, null, null);
+        }
+        boolean degraded = items.stream().anyMatch(i -> EvidenceService.CORE.contains(i.type())
+            && DEGRADING.contains(i.retrievalStatus()));
+        List<String> unknowns = new ArrayList<>(serviceUnknowns(items));
+        unknowns.addAll(v.unknowns());
+        return new Analysis(typed.analysisId(), typed.incidentId(), typed.orderId(), type,
+            degraded ? Analysis.Status.DEGRADED : Analysis.Status.COMPLETED,
+            degraded ? "some expected evidence could not be read" : null, typed.createdAt(), clock.instant(),
+            v.summary(), v.findings(), List.copyOf(unknowns), v.actions(), items, info, v.quality());
+    }
+
+    private Analysis finish(Analysis base, List<EvidenceItem> items, Analysis.Status status, String detail,
+            List<String> unknowns, Analysis.ModelInfo info, String summary, Analysis.Quality quality) {
+        return new Analysis(base.analysisId(), base.incidentId(), base.orderId(), base.incidentType(), status, detail,
+            base.createdAt(), clock.instant(), summary, List.of(), unknowns == null ? List.of() : unknowns, List.of(),
+            items == null ? List.of() : items, info, quality);
+    }
+
+    /** Written by the service, not the model: every source that could not be read. */
+    static List<String> serviceUnknowns(List<EvidenceItem> items) {
+        List<String> out = new ArrayList<>();
+        for (EvidenceItem i : items) {
+            if (!i.ok()) {
+                out.add(i.ref() + " " + i.type() + ": " + i.retrievalStatus()
+                    + (i.detail() == null ? "" : " - " + i.detail()));
+            }
+        }
+        return out;
+    }
+
+    private static byte[] bytes() {
+        byte[] b = new byte[16];
+        RANDOM.nextBytes(b);
+        return b;
+    }
+
+    /** D-008 budget profiles. Evidence bytes approximate tokens at about three bytes per token. */
+    record Profile(String name, int evidenceBytes, int maxOutputTokens) {
+        static Profile of(String name) {
+            return "16k".equalsIgnoreCase(name) ? new Profile("16k", 24_576, 2048)
+                : new Profile("32k", 49_152, 4096);
+        }
+    }
+}
