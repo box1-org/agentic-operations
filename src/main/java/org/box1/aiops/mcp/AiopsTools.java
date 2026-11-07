@@ -47,9 +47,15 @@ public class AiopsTools {
     }
 
     @Tool(name = "list_recent_events", description = "Read-only. Recent domain events for one order or asset from "
-        + "the in-memory Kafka window (hours, not history). Requires aiops-viewer.")
-    String listRecentEvents(@ToolArg(description = "Order ID (ord_...) or asset ID (asset_...)") String key,
+        + "the in-memory Kafka window (hours, not history), by key or by correlationId. Requires aiops-viewer.")
+    String listRecentEvents(
+            @ToolArg(description = "Order ID (ord_...) or asset ID (asset_...)", required = false) String key,
+            @ToolArg(description = "Correlation ID, instead of key", required = false) String correlationId,
             @ToolArg(description = "Maximum events, 1-50, default 20", required = false) Integer limit) {
+        if ((key == null || key.isBlank()) && correlationId != null && !correlationId.isBlank()) {
+            return audit.call("list_recent_events", null,
+                () -> evidence.recentEventsByCorrelation(correlationId, limit));
+        }
         return audit.call("list_recent_events", key, () -> evidence.recentEvents(key, limit));
     }
 

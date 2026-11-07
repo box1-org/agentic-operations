@@ -259,6 +259,37 @@ class AnalysisApiTest {
     @Test
     @TestSecurity(user = "analyst", roles = "aiops-analyst")
     @OidcSecurity(claims = @Claim(key = "azp", value = "agentic-operations-cli"))
+    void anUncitedDiagnosisIsNotShownAsTheSummary() {
+        ScriptedModel.script = r -> ScriptedModel.content("""
+            {"summary":"Root cause: ERP adapter outage after deploy X","findings":[
+              {"statement":"ERP adapter outage","evidenceRefs":["ev_99"],"confidence":"HIGH"}],
+             "unknowns":[],"suggestedActions":[]}""");
+        JsonPath a = Api.await(Api.submit(orderId));
+        assertEquals("COMPLETED", a.getString("status"));
+        assertTrue(a.getString("summary").startsWith("No supported diagnosis"));
+        assertFalse(a.getString("summary").contains("deploy X"));
+        assertTrue(a.getString("statusDetail").contains("no finding was supported"));
+    }
+
+    @Test
+    @TestSecurity(user = "analyst", roles = "aiops-analyst")
+    @OidcSecurity(claims = @Claim(key = "azp", value = "agentic-operations-cli"))
+    void aReferencedRecordOfAnotherOrderIsNotEvidence() {
+        FakeUpstreams.ok(FakeUpstreams.RESERVATIONS, reservationId,
+            Fixtures.reservation(reservationId, "ord_someoneelse"));
+        JsonPath a = Api.await(Api.submit(orderId));
+        assertEquals("DEGRADED", a.getString("status"));
+        List<Map<String, Object>> evidence = a.getList("evidence");
+        Map<String, Object> reservation = evidence.stream().filter(e -> "RESERVATION".equals(e.get("type")))
+            .findFirst().orElseThrow();
+        assertEquals("CONFLICTING", reservation.get("retrievalStatus"));
+        assertNull(reservation.get("data"));
+        assertFalse(evidence.toString().contains("ord_someoneelse"));
+    }
+
+    @Test
+    @TestSecurity(user = "analyst", roles = "aiops-analyst")
+    @OidcSecurity(claims = @Claim(key = "azp", value = "agentic-operations-cli"))
     void theQueueIsBoundedAndExcessRequestsAreBusy() throws Exception {
         CountDownLatch release = new CountDownLatch(1);
         CountDownLatch started = new CountDownLatch(1);
@@ -280,6 +311,9 @@ class AnalysisApiTest {
             }
             given().post("/api/v1/ai/incidents/inc_" + orderId + "/analyze").then().statusCode(429)
                 .header("Retry-After", "30").body("code", is("BUSY"));
+            for (String id : accepted) {
+                given().get("/api/v1/ai/analyses/" + id).then().statusCode(200);
+            }
         } finally {
             release.countDown();
         }

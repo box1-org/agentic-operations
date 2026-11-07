@@ -4,9 +4,9 @@ import java.io.IOException;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
-import java.net.http.HttpResponse;
-import java.net.http.HttpTimeoutException;
 import java.time.Duration;
+
+import org.box1.aiops.BoundedHttp;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -27,7 +27,17 @@ public class VllmModelClient implements ModelClient {
     private final String model;
     private final Duration timeout;
 
+    private final java.util.function.Consumer<HttpRequest.Builder> decorate;
+
     public VllmModelClient(String baseUrl, String model, Duration connectTimeout, Duration timeout, ObjectMapper json) {
+        this(baseUrl, model, connectTimeout, timeout, json, b -> {
+        });
+    }
+
+    /** {@code decorate} adds trace propagation headers; it never adds credentials or content. */
+    public VllmModelClient(String baseUrl, String model, Duration connectTimeout, Duration timeout, ObjectMapper json,
+            java.util.function.Consumer<HttpRequest.Builder> decorate) {
+        this.decorate = decorate;
         String base = baseUrl.endsWith("/") ? baseUrl.substring(0, baseUrl.length() - 1) : baseUrl;
         this.endpoint = URI.create(base + "/chat/completions");
         this.model = model;
@@ -50,28 +60,27 @@ public class VllmModelClient implements ModelClient {
         } catch (IOException e) {
             return ModelResult.failure(ModelResult.Outcome.INVALID, "request could not be encoded");
         }
-        HttpRequest http = HttpRequest.newBuilder(endpoint).timeout(timeout)
+        HttpRequest.Builder builder = HttpRequest.newBuilder(endpoint).timeout(timeout)
             .header("Content-Type", "application/json").header("Accept", "application/json")
-            .POST(HttpRequest.BodyPublishers.ofByteArray(body)).build();
-        HttpResponse<byte[]> response;
+            .POST(HttpRequest.BodyPublishers.ofByteArray(body));
+        decorate.accept(builder);
+        HttpRequest http = builder.build();
+        BoundedHttp.Result response;
         try {
-            response = this.http.send(http, HttpResponse.BodyHandlers.ofByteArray());
-        } catch (HttpTimeoutException e) {
+            response = BoundedHttp.send(this.http, http, MAX_RESPONSE_BYTES, timeout);
+        } catch (BoundedHttp.Timeout e) {
             return ModelResult.failure(ModelResult.Outcome.TIMEOUT, "model did not answer within " + timeout);
-        } catch (IOException e) {
+        } catch (BoundedHttp.Unreachable e) {
             return ModelResult.failure(ModelResult.Outcome.UNAVAILABLE, "model endpoint unreachable");
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            return ModelResult.failure(ModelResult.Outcome.UNAVAILABLE, "interrupted");
         }
-        int status = response.statusCode();
+        int status = response.status();
         if (status == 408 || status == 429 || status >= 500 || status == 404) {
             return ModelResult.failure(ModelResult.Outcome.UNAVAILABLE, "model endpoint HTTP " + status);
         }
         if (status != 200) {
             return ModelResult.failure(ModelResult.Outcome.INVALID, "model rejected the request (HTTP " + status + ")");
         }
-        if (response.body().length > MAX_RESPONSE_BYTES) {
+        if (response.tooLarge()) {
             return ModelResult.failure(ModelResult.Outcome.INVALID, "model response too large");
         }
         return parse(response.body());

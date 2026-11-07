@@ -11,6 +11,7 @@ public final class Ids {
     private static final Pattern ASSET = Pattern.compile("^asset_[A-Za-z0-9_-]{1,122}$");
     private static final Pattern ANALYSIS = Pattern.compile("^ana_[0-9a-f]{32}$");
     private static final Pattern FULFILLMENT = Pattern.compile("^ful_[A-Za-z0-9_-]{1,124}$");
+    private static final Pattern CORRELATION = Pattern.compile("^[A-Za-z0-9._:-]{1,128}$");
     private static final Pattern RESERVATION = Pattern.compile("^res_[A-Za-z0-9_-]{1,124}$");
 
     /** Services whose {@code /api/info} the deployed-revision evidence may read. */
@@ -53,6 +54,10 @@ public final class Ids {
             throw new InvalidArgument("INVALID_SERVICE", "service must be one of " + SERVICES);
         }
         return value;
+    }
+
+    public static String correlation(String value) {
+        return require(CORRELATION, value, "correlationId", "1-128 of [A-Za-z0-9._:-]");
     }
 
     /** Either kind of window key. */

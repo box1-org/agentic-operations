@@ -113,10 +113,47 @@ class EvidenceWindowTest {
         p.putArray("list").add("a");
         w.accept(bytes(e), "t", 0, 1);
         ObjectNode stored = w.forKey("ord_a", 1).get(0).payload();
-        assertTrue(stored.has("note"), "short text is kept as data");
+        assertTrue(stored.has("orderId") && stored.has("reasonCode"), "contract fields are kept");
+        assertFalse(stored.has("note"), "fields outside the contract are dropped");
         assertFalse(stored.has("huge"));
         assertFalse(stored.has("nested"));
         assertFalse(stored.has("list"));
+    }
+
+    @Test
+    void envelopeNeedsSchemaVersionOneAndACausationId() {
+        EvidenceWindow w = window(100, 10);
+        ObjectNode v2 = envelope(UUID.randomUUID().toString(), "order.placed.v1", "ord_a", NOW);
+        v2.put("schemaVersion", 2);
+        ObjectNode noCause = envelope(UUID.randomUUID().toString(), "order.placed.v1", "ord_a", NOW);
+        noCause.remove("causationId");
+        assertEquals("invalid_envelope", w.accept(bytes(v2), "t", 0, 1).reason());
+        assertEquals("invalid_envelope", w.accept(bytes(noCause), "t", 0, 2).reason());
+    }
+
+    @Test
+    void eventsCanBeFoundByCorrelation() {
+        EvidenceWindow w = window(100, 10);
+        ObjectNode a = envelope(UUID.randomUUID().toString(), "order.placed.v1", "ord_a", NOW.minusSeconds(9));
+        ObjectNode b = envelope(UUID.randomUUID().toString(), "shipment.failed.v1", "ord_b", NOW.minusSeconds(5));
+        a.put("correlationId", "corr-shared");
+        b.put("correlationId", "corr-shared");
+        w.accept(bytes(a), "t", 0, 1);
+        w.accept(bytes(b), "t", 0, 2);
+        assertEquals(2, w.forCorrelation("corr-shared", 10).size());
+        assertTrue(w.forCorrelation("corr-other", 10).isEmpty());
+    }
+
+    @Test
+    void outOfOrderEventsArePrunedAndReportedByOccurrenceTime() {
+        EvidenceWindow w = window(2, 10);
+        w.accept(event("order.placed.v1", "ord_new", NOW.minusSeconds(10)), "t", 0, 1);
+        w.accept(event("order.placed.v1", "ord_old", NOW.minus(Duration.ofHours(5))), "t", 1, 1);
+        assertEquals(Duration.ofHours(5).toSeconds(), w.oldestAgeSeconds());
+        w.accept(event("order.placed.v1", "ord_mid", NOW.minusSeconds(60)), "t", 2, 1);
+        assertTrue(w.forKey("ord_old", 10).isEmpty(), "the oldest by time is evicted, not the first to arrive");
+        assertEquals(1, w.forKey("ord_new", 10).size());
+        assertEquals(1, w.forKey("ord_mid", 10).size());
     }
 
     @Test

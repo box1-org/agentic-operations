@@ -6,7 +6,7 @@ import com.fasterxml.jackson.databind.JsonNode;
 public record Fetch(Status status, JsonNode body, String detail) {
 
     public enum Status {
-        OK, NOT_FOUND, UNAUTHORIZED, ERROR, TIMEOUT, UNREACHABLE
+        OK, NOT_FOUND, UNAUTHORIZED, ERROR, TIMEOUT, UNREACHABLE, CONFLICTING
     }
 
     public static Fetch ok(JsonNode body) {

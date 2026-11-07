@@ -25,7 +25,11 @@ class IncidentRulesTest {
         assertEquals("ORDER_EXCEPTION", IncidentRules.derive(order("EXCEPTION", Duration.ZERO), TEN, NOW));
         assertEquals("AWAITING_ERP_TOO_LONG",
             IncidentRules.derive(order("FULFILLMENT_REQUESTED", Duration.ofMinutes(11)), TEN, NOW));
-        assertEquals("NONE", IncidentRules.derive(order("FULFILLMENT_REQUESTED", Duration.ofMinutes(9)), TEN, NOW));
+        assertEquals("AWAITING_ERP_TOO_LONG",
+            IncidentRules.derive(order("FULFILLMENT_REQUESTED", Duration.ofMinutes(9)), TEN, NOW),
+            "still active below the threshold, as in the console's current()");
+        assertEquals(9L, IncidentRules.minutesAwaitingErp(order("FULFILLMENT_REQUESTED", Duration.ofMinutes(9)), NOW));
+        assertEquals(null, IncidentRules.minutesAwaitingErp(order("SHIPPED", Duration.ofMinutes(9)), NOW));
         assertEquals("NONE", IncidentRules.derive(order("SHIPPED", Duration.ofHours(5)), TEN, NOW));
         assertEquals("NONE", IncidentRules.derive(null, TEN, NOW));
     }

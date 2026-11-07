@@ -15,6 +15,11 @@ public final class IncidentRules {
     private IncidentRules() {
     }
 
+    /**
+     * Mirrors the console's {@code Incidents.current()}: an order still awaiting the ERP is an active
+     * {@code AWAITING_ERP_TOO_LONG} incident even below the threshold (review A-4). {@code threshold} is kept for
+     * the console's list view, where it still decides whether the incident is raised.
+     */
     public static String derive(JsonNode order, Duration threshold, Instant now) {
         if (order == null) {
             return NONE;
@@ -24,15 +29,20 @@ public final class IncidentRules {
             return ORDER_EXCEPTION;
         }
         if ("FULFILLMENT_REQUESTED".equals(state)) {
-            try {
-                Instant updated = Instant.parse(order.path("updatedAt").asText());
-                if (updated.plus(threshold).isBefore(now)) {
-                    return AWAITING_ERP_TOO_LONG;
-                }
-            } catch (DateTimeParseException e) {
-                return NONE;
-            }
+            return AWAITING_ERP_TOO_LONG;
         }
         return NONE;
+    }
+
+    /** Minutes the order has been awaiting the ERP, or null when it is not awaiting it. */
+    public static Long minutesAwaitingErp(JsonNode order, Instant now) {
+        if (order == null || !"FULFILLMENT_REQUESTED".equals(order.path("state").asText(""))) {
+            return null;
+        }
+        try {
+            return Math.max(0, Duration.between(Instant.parse(order.path("updatedAt").asText()), now).toMinutes());
+        } catch (DateTimeParseException e) {
+            return null;
+        }
     }
 }

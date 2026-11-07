@@ -52,18 +52,19 @@ Other responses:
 ## Security boundaries
 
 - **Identity:** Keycloak realm `box1`, audience `agentic-operations`, with roles taken from `resource_access/agentic-operations/roles`. Only callers whose `azp` is in `AIOPS_ALLOWED_AZP` (default `agentic-operations-cli`) are accepted.
-- **Rejection:** anonymous calls get 401 at the HTTP layer on `/api/v1/ai/*` and `/mcp`. Roles are checked again in the service layer for REST and MCP alike. MCP tool filters are not used for authorization, because they fail open.
+- **Rejection:** at the HTTP layer, on `/api/v1/ai/*` and `/mcp`, anonymous calls get 401 and calls without an `aiops-*` role get 403. Roles and the accepted client are checked again in the service layer for REST and MCP alike. MCP tool filters are not used for authorization, because they fail open.
 - **Tokens:**
   - Tokens are verified locally only; introspection is off.
   - The OIDC provider logger is set to ERROR, because Quarkus logs the raw token at WARN on failure.
-- **Evidence scope:** evidence is fetched only for the requested order, with IDs validated against the contract patterns before any call.
+- **Evidence scope:** evidence is fetched only for the requested order, with IDs validated against the contract patterns before any call. A referenced fulfillment or reservation whose `orderId` differs is reported as `CONFLICTING`, and its data is not shown.
   - Upstream fields are allowlisted and their strings are bounded.
-  - Kafka payloads keep top-level scalars of 128 characters or fewer.
+  - Kafka payloads keep only the contract fields of each event type, as scalars of 128 characters or fewer.
 - **Model:**
   - The model gets no tools.
   - Evidence goes only in the user message, framed as untrusted JSON, and the system policy is fixed.
-  - Output must match the schema. Findings without valid citations, and actions outside the allowlist, are dropped and counted.
-- **Logs:** prompts, completions, evidence and reasoning output are never logged. Logs carry IDs, outcomes, token counts and durations.
+  - Output must match the schema. Findings without valid citations, and actions outside the allowlist, are dropped and counted. If every finding is dropped, the model's summary is replaced with a fixed "no supported diagnosis" text.
+- **Logs:** prompts, completions, evidence and reasoning output are never logged. Logs carry IDs, outcomes, token counts and durations. The audit log records a caller-supplied ID only when it has a known shape.
+- **Upstream reads:** each has one overall deadline covering headers and body, and the body is capped. A stalled upstream ends as `TIMEOUT`.
 - **Customers:** v1 is operator-only; box1 has no customer identity.
 
 ## Configuration
@@ -76,37 +77,47 @@ Other responses:
 | `AIOPS_CONTEXT_PROFILE` | `32k` | `32k`: 48 KiB of evidence and 4096 output tokens. `16k`: half of each |
 | `ORDER_SERVICE_URL`, `INVENTORY_SERVICE_URL`, `FULFILLMENT_ADAPTER_URL` | dev in-cluster Services | Evidence sources |
 | `KAFKA_BOOTSTRAP_SERVERS` | — | Evidence window |
+| `AIOPS_CONSUMER_GROUP` | `agentic-operations` | One declared group per environment. The window is per pod |
 | `OIDC_AUTH_SERVER_URL` | box1 realm | Token issuer |
 | `AIOPS_ALLOWED_AZP` | `agentic-operations-cli` | Accepted clients, comma-separated |
 | `AIOPS_ANALYSIS_*`, `AIOPS_WINDOW_*` | see `AiopsConfig` | Cache size and TTL (200, 24h), concurrency 1, queue 4, window age 6h, 20,000 events, 200 per key |
 
 ## Kafka evidence window
 
-- **Topics:** consumer group `agentic-operations` on the five `box1.*.events.v1` topics. DLQs are not read.
+- **Topics:** consumer group `agentic-operations` (`AIOPS_CONSUMER_GROUP`) on the five `box1.*.events.v1` topics. DLQs are not read. Run **one replica with the `Recreate` strategy**: with two pods in the group, each holds only part of the partitions.
+- **Indexes:** by `aggregateId` (order or asset) and by `correlationId`. Only contract payload fields are kept.
 - **Read-only:** no offsets are committed and nothing is produced.
 - **Restart:** on partition assignment, each partition seeks to now minus the window age, so a restart refills the window.
-- **Bad records:** duplicates are dropped by `eventId`, or by `alertId` for threshold alerts. Unusable records are skipped and counted in `aiops_kafka_records_total{outcome="skipped",reason}`.
+- **Bad records:** duplicates are dropped by `eventId`, or by `alertId` for threshold alerts. Unusable records, including a wrong `schemaVersion` or a missing `causationId`, are skipped and counted in `aiops_kafka_records_total{outcome="skipped",reason}`.
+- **Seek failure:** if the start-of-window seek fails, `aiops_window_seek_failures_total` counts it. The window then fills from now.
 - **Readiness:** Kafka is not part of readiness.
 
 ## Operations runbook
 
 - **Metrics:**
   - `aiops_analyses_total{status}`
-  - `aiops_analysis_duration_seconds`
+  - `aiops_analysis_duration_seconds{status}`
   - `aiops_model_tokens_total{kind}`
   - `aiops_queue_depth`
   - `aiops_mcp_tool_calls_total{tool,decision}`
   - `aiops_evidence_fetch_total{type,status}`
   - `aiops_window_events`
   - `aiops_window_oldest_age_seconds`
-  - Kafka client lag, through the Micrometer Kafka binder
+  - `aiops_window_seek_failures_total`
+  - Kafka consumer lag: `kafka_consumer_fetch_manager_records_lag_max{topic,partition}`, from the Micrometer Kafka binder. Group lag from a Kafka exporter means nothing here, because this group never commits offsets.
+  - None of these are scraped until the box1-workloads-dev ServiceMonitor exists.
 - **Model down:** analyses end `MODEL_UNAVAILABLE`, and nothing else is affected. Check the `vllm-test` Deployment in namespace `vllm` (box1-docs#26).
 - **Busy (429):** one model call runs at a time, matching vLLM `--max-num-seqs 1`. Raise `AIOPS_ANALYSIS_CONCURRENCY` only together with vLLM.
-- **Empty window after a restart:** expected for a few seconds. `aiops_window_oldest_age_seconds` grows as the window refills. If it stays at 0, check the Kafka bootstrap address and consumer group membership.
+- **Empty window after a restart:** expected while the consumer re-reads the last 6h from every partition. The refill time has not been measured yet. `aiops_window_oldest_age_seconds` grows as the window refills. If it stays at 0, check the Kafka bootstrap address, consumer group membership and `aiops_window_seek_failures_total`.
+- **Shutdown:** queued and running analyses are abandoned (in memory, by design). They are logged and counted as `aiops_analyses_total{status="ABANDONED"}`.
+- **Tracing:** each analysis runs in an `aiops.analysis` span with the `aiops.analysis_id` attribute, under the submitting request's trace. Upstream and model calls carry W3C `traceparent`. Worker logs carry `analysisId` in MDC.
 - **Lost analyses after a restart:** expected (in-memory, single replica). Re-run the analysis. Durable state is box1-docs#97.
 - **Rollback:** promote the previous image digest through box1-workloads-dev. The service keeps no state.
 
 ## Known limits in v1
+
+- `quarkus-mcp-server` 2.0.4 is built against Quarkus 3.33.3.1. On Quarkus 3.40.1.1 it is **tested, not declared compatible**. Check again when either is upgraded.
+- The release smoke test (`box1-quarkus-smoke`) checks only the template endpoints. The 401s on `/api/v1/ai/*` and `/mcp`, and the new OpenAPI paths, are checked by hand at live acceptance.
 
 - Evidence that is unavailable in v1, each listed in `unknowns`:
   - telemetry alerts: no asset-service read grant;

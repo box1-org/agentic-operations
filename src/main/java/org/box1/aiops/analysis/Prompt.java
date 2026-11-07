@@ -71,11 +71,14 @@ public final class Prompt {
     }
 
     public static String user(ObjectMapper json, String incidentId, String incidentType, String orderId,
-            List<EvidenceItem> evidence) {
+            Long minutesAwaitingErp, List<EvidenceItem> evidence) {
         ObjectNode root = json.createObjectNode();
         root.put("task", "Analyze this incident using only the evidence below.");
         ObjectNode incident = root.putObject("incident");
         incident.put("incidentId", incidentId).put("type", incidentType).put("orderId", orderId);
+        if (minutesAwaitingErp != null) {
+            incident.put("minutesAwaitingErp", minutesAwaitingErp);
+        }
         ArrayNode items = root.putArray("evidence");
         for (EvidenceItem e : evidence) {
             ObjectNode o = items.addObject();

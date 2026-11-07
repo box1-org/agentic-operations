@@ -83,6 +83,9 @@ class McpToolsTest {
         assertEquals("fulfillment-adapter:/api/fulfillments/" + fulfillmentId, fulfillment.getString("link"));
         JsonPath events = Mcp.result(mcp.call("list_recent_events", Mcp.args("key", orderId)));
         assertEquals(1, events.getList("data").size());
+        JsonPath byCorrelation = Mcp.result(mcp.call("list_recent_events",
+            Mcp.args("correlationId", "corr-" + orderId)));
+        assertEquals(1, byCorrelation.getList("data").size());
         JsonPath alerts = Mcp.result(mcp.call("list_telemetry_alerts", null));
         assertEquals("UNAVAILABLE", alerts.getString("retrievalStatus"));
         JsonPath revision = Mcp.result(mcp.call("get_deployed_revision", Mcp.args("service", "order-service")));
@@ -102,9 +105,8 @@ class McpToolsTest {
     @Test
     @TestSecurity(user = "nobody", roles = "customer")
     @OidcSecurity(claims = @Claim(key = "azp", value = "agentic-operations-cli"))
-    void callersWithoutAnAiopsRoleGetNoEvidence() {
-        JsonPath r = Mcp.connect().call("get_order_timeline", Mcp.args("orderId", orderId));
-        assertTrue(r.getBoolean("result.isError"));
+    void callersWithoutAnAiopsRoleCannotConnect() {
+        Mcp.initializeRaw().then().statusCode(403);
         assertTrue(FakeUpstreams.CALLS.isEmpty());
     }
 

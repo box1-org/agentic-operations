@@ -8,7 +8,7 @@ import java.util.Map;
 import java.util.Optional;
 
 /**
- * Bounded in-memory analyses (D-003): at most {@code maxEntries}, each for {@code ttl} after creation. Nothing
+ * Bounded in-memory analyses (D-003): at most {@code maxEntries}, each for {@code ttl} after completion. Nothing
  * survives a restart; a lost ID reads as not found. One replica only.
  */
 public class AnalysisStore {
@@ -30,10 +30,17 @@ public class AnalysisStore {
         };
     }
 
+    /** TTL counts from completion; an unfinished analysis is held for the TTL from its creation (review A-7). */
     public synchronized void put(Analysis analysis, String requestedBy) {
-        Entry existing = entries.get(analysis.analysisId());
-        Instant expires = existing != null ? existing.expiresAt() : analysis.createdAt().plus(ttl);
+        Instant expires = analysis.status().terminal() ? clock.instant().plus(ttl) : analysis.createdAt().plus(ttl);
         entries.put(analysis.analysisId(), new Entry(analysis, requestedBy, expires));
+    }
+
+    /** Adds the entry unless the worker already wrote a later state. */
+    public synchronized void putIfAbsent(Analysis analysis, String requestedBy) {
+        if (!entries.containsKey(analysis.analysisId())) {
+            put(analysis, requestedBy);
+        }
     }
 
     public synchronized Optional<Analysis> get(String id) {

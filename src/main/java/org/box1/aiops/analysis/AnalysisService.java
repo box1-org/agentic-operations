@@ -30,9 +30,16 @@ import org.box1.aiops.security.Guard;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 
+import org.jboss.logging.MDC;
+
 import io.micrometer.core.instrument.Gauge;
 import io.micrometer.core.instrument.MeterRegistry;
 import io.micrometer.core.instrument.Timer;
+import io.opentelemetry.api.trace.Span;
+import io.opentelemetry.api.trace.StatusCode;
+import io.opentelemetry.api.trace.Tracer;
+import io.opentelemetry.context.Context;
+import io.opentelemetry.context.Scope;
 import io.quarkus.logging.Log;
 
 /**
@@ -45,7 +52,9 @@ import io.quarkus.logging.Log;
 public class AnalysisService {
     private static final SecureRandom RANDOM = new SecureRandom();
     /** Read failures of an expected source. Service-declared gaps (UNAVAILABLE) do not degrade an analysis. */
-    static final Set<String> DEGRADING = Set.of("NOT_FOUND", "UNAUTHORIZED", "ERROR", "TIMEOUT", "UNREACHABLE");
+    static final String UNSUPPORTED_SUMMARY = "No supported diagnosis: none of the model's findings cited "
+        + "evidence that exists. Review the evidence directly.";
+    static final Set<String> DEGRADING = Set.of("NOT_FOUND", "UNAUTHORIZED", "ERROR", "TIMEOUT", "UNREACHABLE", "CONFLICTING");
 
     private final Guard guard;
     private final Upstreams upstreams;
@@ -57,10 +66,12 @@ public class AnalysisService {
     private final AnalysisStore store;
     private final ThreadPoolExecutor workers;
     private final Clock clock = Clock.systemUTC();
+    private final Tracer tracer;
 
     @Inject
     public AnalysisService(Guard guard, Upstreams upstreams, EvidenceService evidence, ModelClient model,
-            ObjectMapper json, AiopsConfig config, MeterRegistry registry) {
+            ObjectMapper json, AiopsConfig config, MeterRegistry registry, Tracer tracer) {
+        this.tracer = tracer;
         this.guard = guard;
         this.upstreams = upstreams;
         this.evidence = evidence;
@@ -82,7 +93,13 @@ public class AnalysisService {
 
     @PreDestroy
     void stop() {
-        workers.shutdownNow();
+        int dropped = workers.shutdownNow().size();
+        int running = workers.getActiveCount();
+        if (dropped + running > 0) {
+            registry.counter("aiops_analyses_total", "status", "ABANDONED").increment(dropped + running);
+            Log.warnf("shutdown abandoned %d queued and %d running analyses (in-memory, by design)", dropped,
+                running);
+        }
     }
 
     /** Authorizes, resolves the incident and queues the analysis. Unknown orders never reach the model. */
@@ -96,14 +113,15 @@ public class AnalysisService {
         String id = "ana_" + HexFormat.of().formatHex(bytes());
         Analysis queued = Analysis.queued(id, incidentId, orderId, clock.instant());
         String subject = guard.subject();
-        store.put(queued, subject);
+        // Reserve the queue slot first: a BUSY rejection must never touch the store (review A-2).
+        Runnable task = Context.current().wrap(() -> run(queued, subject));
         try {
-            workers.execute(() -> run(queued, subject));
+            workers.execute(task);
         } catch (RejectedExecutionException e) {
-            store.remove(id);
             registry.counter("aiops_analyses_total", "status", "BUSY").increment();
             throw new Busy("analysis queue is full; retry later");
         }
+        store.putIfAbsent(queued, subject);
         Log.infof("analysis queued analysisId=%s incidentId=%s subject=%s", id, incidentId, subject);
         return queued;
     }
@@ -116,20 +134,38 @@ public class AnalysisService {
                 + " and do not survive a restart"));
     }
 
+    /** Runs on a worker with the submitting request's trace context (review A-6, O-1). */
     private void run(Analysis queued, String subject) {
         Timer.Sample sample = Timer.start(registry);
+        Span span = tracer.spanBuilder("aiops.analysis").setAttribute("aiops.analysis_id", queued.analysisId())
+            .setAttribute("aiops.incident_id", queued.incidentId()).startSpan();
+        MDC.put("analysisId", queued.analysisId());
         Analysis result;
-        try {
+        try (Scope ignored = span.makeCurrent()) {
             store.put(queued.running(), subject);
             result = analyze(queued);
         } catch (RuntimeException e) {
-            Log.errorf("analysis %s failed: %s", queued.analysisId(), e.getClass().getSimpleName());
+            Log.errorf("analysis %s failed: %s at %s", queued.analysisId(), e.getClass().getSimpleName(), where(e));
+            span.setStatus(StatusCode.ERROR);
             result = finish(queued, null, Analysis.Status.FAILED, "internal error", List.of(), null, null, null);
         }
         store.put(result, subject);
+        span.setAttribute("aiops.status", result.status().name());
+        span.end();
         sample.stop(registry.timer("aiops_analysis_duration_seconds", "status", result.status().name()));
         registry.counter("aiops_analyses_total", "status", result.status().name()).increment();
         Log.infof("analysis finished analysisId=%s status=%s", result.analysisId(), result.status());
+        MDC.remove("analysisId");
+    }
+
+    /** First org.box1 stack frame, for diagnosis without the message (which may contain evidence) (review O-4). */
+    static String where(Throwable e) {
+        for (StackTraceElement f : e.getStackTrace()) {
+            if (f.getClassName().startsWith("org.box1.")) {
+                return f.getClassName() + "." + f.getMethodName() + ":" + f.getLineNumber();
+            }
+        }
+        return "unknown";
     }
 
     private Analysis analyze(Analysis queued) {
@@ -137,6 +173,7 @@ public class AnalysisService {
         EvidenceService.Bundle bundle = evidence.gather(queued.orderId(), profile.evidenceBytes());
         List<EvidenceItem> items = bundle.items();
         String type = IncidentRules.derive(bundle.order(), config.analysis().stuckThreshold(), clock.instant());
+        Long awaiting = IncidentRules.minutesAwaitingErp(bundle.order(), clock.instant());
         Analysis typed = new Analysis(queued.analysisId(), queued.incidentId(), queued.orderId(), type,
             Analysis.Status.RUNNING, null, queued.createdAt(), null, null, List.of(), List.of(), List.of(), items,
             null, null);
@@ -146,7 +183,7 @@ public class AnalysisService {
                 serviceUnknowns(items), null, null, null);
         }
         ModelRequest request = new ModelRequest(Prompt.SYSTEM,
-            Prompt.user(json, queued.incidentId(), type, queued.orderId(), items), Prompt.schema(json),
+            Prompt.user(json, queued.incidentId(), type, queued.orderId(), awaiting, items), Prompt.schema(json),
             profile.maxOutputTokens());
         ModelResult answer = model.complete(request);
         Analysis.ModelInfo info = new Analysis.ModelInfo(model.modelId(), profile.name(), answer.promptTokens(),
@@ -184,10 +221,16 @@ public class AnalysisService {
             && DEGRADING.contains(i.retrievalStatus()));
         List<String> unknowns = new ArrayList<>(serviceUnknowns(items));
         unknowns.addAll(v.unknowns());
+        String summary = v.summary();
+        String detail = degraded ? "some expected evidence could not be read" : null;
+        if (v.findings().isEmpty() && v.quality().unsupportedAssertions() > 0) {
+            // Every finding the model made was uncited, so its prose is not shown as the answer (review A-1).
+            summary = UNSUPPORTED_SUMMARY;
+            detail = (detail == null ? "" : detail + "; ") + "no finding was supported by the evidence";
+        }
         return new Analysis(typed.analysisId(), typed.incidentId(), typed.orderId(), type,
-            degraded ? Analysis.Status.DEGRADED : Analysis.Status.COMPLETED,
-            degraded ? "some expected evidence could not be read" : null, typed.createdAt(), clock.instant(),
-            v.summary(), v.findings(), List.copyOf(unknowns), v.actions(), items, info, v.quality());
+            degraded ? Analysis.Status.DEGRADED : Analysis.Status.COMPLETED, detail, typed.createdAt(),
+            clock.instant(), summary, v.findings(), List.copyOf(unknowns), v.actions(), items, info, v.quality());
     }
 
     private Analysis finish(Analysis base, List<EvidenceItem> items, Analysis.Status status, String detail,

@@ -104,6 +104,13 @@ public class EvidenceService {
         return events(key, window.forKey(key, size)).withRef("ev_1");
     }
 
+    public EvidenceItem recentEventsByCorrelation(String correlationId, Integer limit) {
+        guard.requireViewer();
+        Ids.correlation(correlationId);
+        int size = limit == null ? EVENTS_DEFAULT : Math.max(1, Math.min(EVENTS_MAX, limit));
+        return events("correlation:" + correlationId, window.forCorrelation(correlationId, size)).withRef("ev_1");
+    }
+
     public EvidenceItem deployedRevision(String service) {
         guard.requireViewer();
         Ids.service(service);
@@ -191,7 +198,7 @@ public class EvidenceService {
                 "fulfillmentRequestId for " + orderId + " is not in the event window (box1-docs#78)", null, false,
                 null);
         }
-        Fetch fetch = counted(FULFILLMENT, upstreams.fulfillment(fulfillmentId));
+        Fetch fetch = belongsTo(orderId, counted(FULFILLMENT, upstreams.fulfillment(fulfillmentId)));
         return item(FULFILLMENT, "fulfillment-adapter", "fulfillment-adapter:/api/fulfillments/" + fulfillmentId,
             fetch, b -> Sanitizer.object(b, Sanitizer.FULFILLMENT), b -> instant(b, "updatedAt"));
     }
@@ -204,7 +211,7 @@ public class EvidenceService {
             return new EvidenceItem(null, RESERVATION, "inventory-service", null, now(), "UNAVAILABLE", why, null,
                 false, null);
         }
-        Fetch fetch = counted(RESERVATION, upstreams.reservation(reservationId));
+        Fetch fetch = belongsTo(orderId, counted(RESERVATION, upstreams.reservation(reservationId)));
         return item(RESERVATION, "inventory-service", "inventory-service:/api/v1/reservations/" + reservationId,
             fetch, b -> Sanitizer.object(b, Sanitizer.RESERVATION), b -> instant(b, "updatedAt"));
     }
@@ -239,6 +246,14 @@ public class EvidenceService {
         }
         return new EvidenceItem(null, type, source, timestamp.apply(fetch.body()), now(), EvidenceItem.OK, null, link,
             false, shape.apply(fetch.body()));
+    }
+
+    /** A referenced record whose orderId is not this order is not evidence for it (review S-6). */
+    private static Fetch belongsTo(String orderId, Fetch fetch) {
+        if (fetch.isOk() && !orderId.equals(text(fetch.body(), "orderId"))) {
+            return Fetch.of(Fetch.Status.CONFLICTING, "referenced record belongs to a different order; not shown");
+        }
+        return fetch;
     }
 
     private Fetch counted(String type, Fetch fetch) {

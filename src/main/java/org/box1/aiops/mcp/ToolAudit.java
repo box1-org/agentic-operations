@@ -35,6 +35,17 @@ public class ToolAudit {
         this.registry = registry;
     }
 
+    private static final java.util.regex.Pattern LOGGABLE =
+        java.util.regex.Pattern.compile("^(ord|inc_ord|asset|ana)_[A-Za-z0-9_-]{1,124}$|^[a-z][a-z-]{1,40}$");
+
+    /** Only IDs of a known shape reach the audit log; anything else is logged as "invalid" (review S-5). */
+    static String loggableId(String id) {
+        if (id == null || id.isEmpty()) {
+            return "-";
+        }
+        return LOGGABLE.matcher(id).matches() ? id : "invalid";
+    }
+
     public String call(String tool, String id, Supplier<Object> body) {
         long start = System.nanoTime();
         String decision = "allowed";
@@ -69,7 +80,7 @@ public class ToolAudit {
             long ms = (System.nanoTime() - start) / 1_000_000;
             registry.counter("aiops_mcp_tool_calls_total", "tool", tool, "decision", decision).increment();
             Log.infof("mcp_tool tool=%s id=%s subject=%s decision=%s durationMs=%d resultBytes=%d", tool,
-                id == null ? "-" : id.length() > 140 ? "invalid" : id, guard.subject(), decision, ms, bytes);
+                loggableId(id), guard.subject(), decision, ms, bytes);
         }
     }
 }
