@@ -1,0 +1,6 @@
+site_name: agentic-operations
+site_description: "AI Enabled Operations"
+nav:
+  - Home: index.md
+plugins:
+  - techdocs-core

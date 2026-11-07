@@ -1,0 +1,55 @@
+apiVersion: backstage.io/v1alpha1
+kind: Component
+metadata:
+  name: agentic-operations
+  description: "AI Enabled Operations"
+  annotations:
+    github.com/project-slug: box1-org/agentic-operations
+    backstage.io/kubernetes-id: agentic-operations
+    backstage.io/techdocs-ref: dir:.
+    backstage.io/source-location: url:https://github.com/box1-org/agentic-operations/
+    janus-idp.io/tekton: agentic-operations
+    argocd/instance-name: openshift-gitops
+    argocd/app-selector: backstage.io/kubernetes-id=agentic-operations
+    box1.org/template-version: "1.1.0"
+  tags: [java, quarkus, maven, tekton, gitops]
+  links:
+    - url: https://github.com/box1-org/agentic-operations
+      title: Source Repository
+      icon: github
+    - url: https://agentic-operations-dev.apps.ocp.box1.org/q/swagger-ui/
+      title: Swagger UI — test endpoints
+      icon: code
+    - url: https://agentic-operations-dev.apps.ocp.box1.org/q/openapi
+      title: OpenAPI specification
+      icon: code
+    - url: https://agentic-operations-dev.apps.ocp.box1.org
+      title: Application Route (after first release)
+    - url: https://github.com/box1-org/box1-workloads-dev/tree/main/workloads/agentic-operations
+      title: Desired deployment configuration
+    - url: https://devspaces.apps.ocp.box1.org/#https://github.com/box1-org/agentic-operations
+      title: Open in Dev Spaces
+      icon: code
+    # Add actual service-specific observability URLs
+    # when dashboards and log views exist.
+spec:
+  type: service
+  lifecycle: experimental
+  owner: "user:default/mike4263"
+  # Add when the corresponding System entity exists:
+  # system: box1-demo
+  providesApis:
+    - agentic-operations-api
+---
+apiVersion: backstage.io/v1alpha1
+kind: API
+metadata:
+  name: agentic-operations-api
+  description: OpenAPI contract for agentic-operations
+  tags: [quarkus, openapi]
+spec:
+  type: openapi
+  lifecycle: experimental
+  owner: "user:default/mike4263"
+  definition:
+    $text: https://agentic-operations-dev.apps.ocp.box1.org/q/openapi
