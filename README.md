@@ -1,5 +1,8 @@
 # agentic-operations
 
+Evidence-grounded incident analysis over REST and MCP for box1 Operations. See [docs/index.md](docs/index.md) for the API, MCP tool catalog, security boundaries, configuration and runbook.
+
+
 AI Enabled Operations
 
 Owner: `user:default/mike4263`. Quarkus 3.40.1.1, Java 21, Maven 3.9.16.
