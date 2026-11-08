@@ -21,7 +21,10 @@ spec:
   - name: git-auth-secret
     value: "{{git_auth_secret}}"
   - name: security-gates
-    value: disabled
+    # Same enforcement as every other box1 service (box1-docs#42): RHACS scans and checks the image and the SBOM goes
+    # to RHTPA before promotion. The template default "disabled" shipped images unchecked, and its no-op path left the
+    # SCAN_OUTPUT pipeline result unset, so every release PipelineRun ended CouldntGetPipelineResult.
+    value: gate
   pipelineSpec:
     params:
     - name: revision
@@ -142,8 +145,8 @@ spec:
       value: "$(tasks.promote.results.pr-url)"
     - name: gitops-revision
       value: "$(tasks.promote.results.gitops-revision)"
-    # Read by the OpenShift Pipelines console Vulnerabilities column. Emitted
-    # only when box1-security-gates produced a scan summary; otherwise "-".
+    # Read by the OpenShift Pipelines console Vulnerabilities column. box1-security-gates always writes it: the
+    # vulnerability counts, or "unavailable" when RHACS gave no summary (box1-docs#42).
     - name: SCAN_OUTPUT
       value: "$(tasks.security.results.SCAN_OUTPUT)"
   taskRunSpecs:
