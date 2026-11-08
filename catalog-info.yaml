@@ -40,6 +40,22 @@ spec:
   # system: box1-demo
   providesApis:
     - agentic-operations-api
+  consumesApis:
+    - order-service-api
+    - inventory-service-api
+    - fulfillment-adapter-api
+    - box1-order-events
+    - box1-inventory-events
+    - box1-fulfillment-events
+    - box1-telemetry-events
+    - box1-notification-events
+  dependsOn:
+    - component:order-service
+    - component:inventory-service
+    - component:fulfillment-adapter
+    - resource:box1-kafka
+    - resource:vllm-test-2
+    - resource:keycloak-box1
 ---
 apiVersion: backstage.io/v1alpha1
 kind: API
