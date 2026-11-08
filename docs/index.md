@@ -4,6 +4,8 @@ Evidence-grounded incident analysis for box1 Operations ([box1-docs#20](https://
 
 Given an incident from the operations console (`inc_<orderId>`), the service collects read-only evidence about that one order. It asks the local model (vLLM `box1-coder`) for a structured analysis and returns findings, each of which cites the evidence behind it. The same capability is exposed as REST and as MCP tools.
 
+It also serves the operations console's **Assistant** ([box1-docs#101](https://github.com/box1-org/box1-docs/issues/101), decision D-016). This is a free-form chat in which the model may call the read-only evidence tools listed below, in a bounded loop, under the asking person's own roles.
+
 The service is **read and propose only**:
 
 - It has no write route or tool, and no connector that can change a system.
@@ -15,6 +17,9 @@ The service is **read and propose only**:
 |---|---|---|
 | Queue an analysis | `POST /api/v1/ai/incidents/{incidentId}/analyze` → 202 with `analysisId` | `aiops-analyst` |
 | Read an analysis | `GET /api/v1/ai/analyses/{analysisId}` | `aiops-viewer` or `aiops-analyst` |
+| Start a conversation | `POST /api/v1/ai/conversations` → 201 with `conversationId` | `aiops-viewer` or `aiops-analyst` |
+| Ask a question | `POST /api/v1/ai/conversations/{conversationId}/messages` with body `{"text"}` → 202 with `turnId` | same, own conversations only |
+| Read a conversation | `GET /api/v1/ai/conversations/{conversationId}` | same, own conversations only |
 | MCP (Streamable HTTP) | `/mcp` | as below |
 | OpenAPI | `/q/openapi` | — |
 
@@ -49,6 +54,39 @@ Other responses:
 - `429 BUSY` with `Retry-After: 30` when the model queue is full.
 - `404 ANALYSIS_NOT_FOUND` for an unknown or expired ID. Analyses live in memory and are lost on restart.
 
+### Assistant chat (D-016)
+
+A message is answered on the shared model queue by a bounded loop:
+
+- The model may call `get_order_timeline`, `get_fulfillment_status`, `get_inventory_reservation`, `list_recent_events`, `get_deployed_revision` and `get_analysis`. These are the same reads as the MCP tools.
+- It cannot start an analysis, and nothing it can call writes, executes, runs a shell, calls the Kubernetes API or fetches a URL.
+- Every argument is validated against the contract ID patterns before any read. An unknown tool or an invalid argument comes back to the model as an error, with no read made.
+- Every result is wrapped as untrusted data and capped at `source-max-bytes`.
+
+**Per-message limits:**
+- 8 tool calls and 4 model rounds. When the budget is spent, one last call without tools gives the answer, and the turn status is `LIMIT_REACHED`.
+- A 90 s deadline.
+- At most 1024 answer tokens.
+- At most 2000 question characters.
+
+**History:** the model sees the earlier questions and answers of the same conversation, but not their tool results.
+
+**Conversations:**
+- They live in memory: 200 at most, forgotten after 2 h idle, lost on restart.
+- Each one belongs to the person who started it. Anyone else gets `404 CONVERSATION_NOT_FOUND`.
+- There are at most 20 messages per conversation, and one message at a time. A second message while one runs gets `409 TURN_IN_PROGRESS`.
+
+**Turn statuses:**
+
+| Status | Meaning |
+|---|---|
+| `QUEUED`, `RUNNING` | In progress. `steps` grows as tools are read. |
+| `COMPLETED` | `answer` is the model's text. |
+| `LIMIT_REACHED` | `answer` was given after the tool budget ran out. |
+| `MODEL_UNAVAILABLE`, `MODEL_INVALID_OUTPUT`, `FAILED` | No answer is shown. |
+
+Each step records `tool`, `target` (a validated ID only), `decision` (`ok`, `invalid_argument`, `not_found`, `unknown_tool`, `limit` or `error`), `retrievalStatus` and `durationMs`.
+
 ## Security boundaries
 
 - **Identity:** Keycloak realm `box1`, audience `agentic-operations`, with roles taken from `resource_access/agentic-operations/roles`. Only callers whose `azp` is in `AIOPS_ALLOWED_AZP` (default `agentic-operations-cli`) are accepted.
@@ -60,10 +98,15 @@ Other responses:
   - Upstream fields are allowlisted and their strings are bounded.
   - Kafka payloads keep only the contract fields of each event type, as scalars of 128 characters or fewer.
 - **Model:**
-  - The model gets no tools.
-  - Evidence goes only in the user message, framed as untrusted JSON, and the system policy is fixed.
+  - **Analyses:** the model gets no tools (D-006). Evidence goes only in the user message, framed as untrusted JSON, and the system policy is fixed.
+  - **Assistant chat (D-016, supersedes D-006 and D-010 for chat only):**
+    - The model chooses among the read-only tools above, so injected text in evidence can steer which reads happen.
+    - Every read is still validated, read-only, limited by the per-message budget, and within what the asking person may already see.
+    - Answers return only to that person, and no tool can send data elsewhere.
+    - The system policy `aiops-chat-policy-1` tells the model to treat tool results as data and never to claim it did anything.
+    - Answers are model text and can be wrong; the console labels them so.
   - Output must match the schema. Findings without valid citations, and actions outside the allowlist, are dropped and counted. If every finding is dropped, the model's summary is replaced with a fixed "no supported diagnosis" text.
-- **Logs:** prompts, completions, evidence and reasoning output are never logged. Logs carry IDs, outcomes, token counts and durations. The audit log records a caller-supplied ID only when it has a known shape.
+- **Logs:** prompts, completions, chat questions and answers, evidence and reasoning output are never logged. Logs carry IDs, outcomes, token counts and durations. The audit log records a caller-supplied ID only when it has a known shape.
 - **Upstream reads:** each has one overall deadline covering headers and body, and the body is capped. A stalled upstream ends as `TIMEOUT`.
 - **Customers:** v1 is operator-only; box1 has no customer identity.
 
@@ -100,6 +143,9 @@ Other responses:
   - `aiops_model_tokens_total{kind}`
   - `aiops_queue_depth`
   - `aiops_mcp_tool_calls_total{tool,decision}`
+  - `aiops_chat_turns_total{status}`
+  - `aiops_chat_turn_duration_seconds{status}`
+  - `aiops_chat_tool_calls_total{tool,decision}` (tool is a known name or `unknown`)
   - `aiops_evidence_fetch_total{type,status}`
   - `aiops_window_events`
   - `aiops_window_oldest_age_seconds`
@@ -107,10 +153,10 @@ Other responses:
   - Kafka consumer lag: `kafka_consumer_fetch_manager_records_lag_max{topic,partition}`, from the Micrometer Kafka binder. Group lag from a Kafka exporter means nothing here, because this group never commits offsets.
   - None of these are scraped until the box1-workloads-dev ServiceMonitor exists.
 - **Model down:** analyses end `MODEL_UNAVAILABLE`, and nothing else is affected. Check the `vllm-test` Deployment in namespace `vllm` (box1-docs#26).
-- **Busy (429):** one model call runs at a time, matching vLLM `--max-num-seqs 1`. Raise `AIOPS_ANALYSIS_CONCURRENCY` only together with vLLM.
+- **Busy (429):** one model job runs at a time, matching vLLM `--max-num-seqs 1`. Analyses and Assistant messages share the queue of 4, and a message holds the slot for its whole tool loop (90 s at most). Raise `AIOPS_ANALYSIS_CONCURRENCY` only together with vLLM.
 - **Empty window after a restart:** expected while the consumer re-reads the last 6h from every partition. The refill time has not been measured yet. `aiops_window_oldest_age_seconds` grows as the window refills. If it stays at 0, check the Kafka bootstrap address, consumer group membership and `aiops_window_seek_failures_total`.
-- **Shutdown:** queued and running analyses are abandoned (in memory, by design). They are logged and counted as `aiops_analyses_total{status="ABANDONED"}`.
-- **Tracing:** each analysis runs in an `aiops.analysis` span with the `aiops.analysis_id` attribute, under the submitting request's trace. Upstream and model calls carry W3C `traceparent`. Worker logs carry `analysisId` in MDC.
+- **Shutdown:** queued and running analyses and chat messages are abandoned (in memory, by design). They are logged and counted as `aiops_model_work_abandoned_total`.
+- **Tracing:** each chat message runs in an `aiops.chat.turn` span, with one `aiops.chat.tool` span per read. Each analysis runs in an `aiops.analysis` span with the `aiops.analysis_id` attribute, under the submitting request's trace. Upstream and model calls carry W3C `traceparent`. Worker logs carry `analysisId` in MDC.
 - **Lost analyses after a restart:** expected (in-memory, single replica). Re-run the analysis. Durable state is box1-docs#97.
 - **Rollback:** promote the previous image digest through box1-workloads-dev. The service keeps no state.
 

@@ -12,6 +12,8 @@ import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.concurrent.atomic.AtomicReference;
 
+import org.box1.aiops.model.ChatMessage;
+
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -112,6 +114,56 @@ class VllmModelClientTest {
         ModelResult r = client(Duration.ofSeconds(5)).complete(request());
         assertEquals(ModelResult.Outcome.INVALID, r.outcome());
         assertTrue(r.detail().contains("tool"));
+    }
+
+    ChatRequest chatRequest(boolean withTools) {
+        return new ChatRequest(java.util.List.of(ChatMessage.system("policy"), ChatMessage.user("question"),
+            ChatMessage.assistant(null, java.util.List.of(new ToolCall("c0", "get_order_timeline", "{\"orderId\":\"ord_1\"}"))),
+            ChatMessage.tool("c0", "{\"untrusted\":true}")),
+            withTools ? java.util.List.of(new ToolSpec("get_order_timeline", "Read-only.",
+                JSON.createObjectNode().put("type", "object"))) : java.util.List.of(), 256);
+    }
+
+    @Test
+    void chatOffersToolsAndReturnsTheCallsForTheCallerToVet() {
+        reply.set(completion(null, "tool_calls",
+            "[{\"id\":\"c1\",\"type\":\"function\",\"function\":{\"name\":\"get_order_timeline\",\"arguments\":\"{\\\"orderId\\\":\\\"ord_2\\\"}\"}}]"));
+        ChatResult r = client(Duration.ofSeconds(5)).chat(chatRequest(true));
+        assertEquals(ModelResult.Outcome.OK, r.outcome());
+        assertEquals(1, r.toolCalls().size());
+        assertEquals("get_order_timeline", r.toolCalls().get(0).name());
+        assertEquals("{\"orderId\":\"ord_2\"}", r.toolCalls().get(0).argumentsJson());
+        JsonNode sent = lastRequest.get();
+        assertEquals("get_order_timeline", sent.path("tools").path(0).path("function").path("name").asText());
+        assertEquals("auto", sent.path("tool_choice").asText());
+        assertTrue(sent.path("response_format").isMissingNode(), "chat answers in text");
+        assertEquals("tool", sent.path("messages").path(3).path("role").asText());
+        assertEquals("c0", sent.path("messages").path(3).path("tool_call_id").asText());
+        assertEquals("c0", sent.path("messages").path(2).path("tool_calls").path(0).path("id").asText());
+        assertEquals(false, sent.path("chat_template_kwargs").path("enable_thinking").asBoolean(true));
+    }
+
+    @Test
+    void chatTextAnswersAreReturnedAndReasoningIsDropped() {
+        reply.set(completion("The order is waiting on the ERP.", "stop", null));
+        ChatResult r = client(Duration.ofSeconds(5)).chat(chatRequest(true));
+        assertEquals("The order is waiting on the ERP.", r.content());
+        assertTrue(r.toolCalls().isEmpty());
+        assertFalse(String.valueOf(r).contains("chain of thought"));
+    }
+
+    @Test
+    void chatRefusesToolCallsWhenNoneWereOfferedAndTruncation() {
+        reply.set(completion(null, "tool_calls",
+            "[{\"id\":\"c1\",\"type\":\"function\",\"function\":{\"name\":\"delete_order\",\"arguments\":\"{}\"}}]"));
+        ChatResult r = client(Duration.ofSeconds(5)).chat(chatRequest(false));
+        assertEquals(ModelResult.Outcome.INVALID, r.outcome());
+        assertTrue(lastRequest.get().path("tools").isMissingNode());
+        reply.set(completion("cut off", "length", null));
+        assertEquals(ModelResult.Outcome.INVALID, client(Duration.ofSeconds(5)).chat(chatRequest(true)).outcome());
+        status.set(503);
+        reply.set("{}");
+        assertEquals(ModelResult.Outcome.UNAVAILABLE, client(Duration.ofSeconds(5)).chat(chatRequest(true)).outcome());
     }
 
     @Test

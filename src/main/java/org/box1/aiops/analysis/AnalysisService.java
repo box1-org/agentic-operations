@@ -7,12 +7,7 @@ import java.util.HexFormat;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
-import java.util.concurrent.ArrayBlockingQueue;
-import java.util.concurrent.RejectedExecutionException;
-import java.util.concurrent.ThreadPoolExecutor;
-import java.util.concurrent.TimeUnit;
 
-import jakarta.annotation.PreDestroy;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 
@@ -32,7 +27,6 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 
 import org.jboss.logging.MDC;
 
-import io.micrometer.core.instrument.Gauge;
 import io.micrometer.core.instrument.MeterRegistry;
 import io.micrometer.core.instrument.Timer;
 import io.opentelemetry.api.trace.Span;
@@ -64,13 +58,13 @@ public class AnalysisService {
     private final AiopsConfig config;
     private final MeterRegistry registry;
     private final AnalysisStore store;
-    private final ThreadPoolExecutor workers;
+    private final ModelGate gate;
     private final Clock clock = Clock.systemUTC();
     private final Tracer tracer;
 
     @Inject
     public AnalysisService(Guard guard, Upstreams upstreams, EvidenceService evidence, ModelClient model,
-            ObjectMapper json, AiopsConfig config, MeterRegistry registry, Tracer tracer) {
+            ObjectMapper json, AiopsConfig config, MeterRegistry registry, Tracer tracer, ModelGate gate) {
         this.tracer = tracer;
         this.guard = guard;
         this.upstreams = upstreams;
@@ -81,28 +75,10 @@ public class AnalysisService {
         this.registry = registry;
         AiopsConfig.Analysis a = config.analysis();
         this.store = new AnalysisStore(clock, a.ttl(), a.maxEntries());
-        this.workers = new ThreadPoolExecutor(a.concurrency(), a.concurrency(), 60, TimeUnit.SECONDS,
-            new ArrayBlockingQueue<>(Math.max(1, a.queueBound())), r -> {
-                Thread t = new Thread(r, "aiops-analysis");
-                t.setDaemon(true);
-                return t;
-            }, new ThreadPoolExecutor.AbortPolicy());
-        Gauge.builder("aiops_queue_depth", workers, w -> w.getQueue().size())
-            .description("Analyses waiting for the model").register(registry);
+        this.gate = gate;
     }
 
-    @PreDestroy
-    void stop() {
-        int dropped = workers.shutdownNow().size();
-        int running = workers.getActiveCount();
-        if (dropped + running > 0) {
-            registry.counter("aiops_analyses_total", "status", "ABANDONED").increment(dropped + running);
-            Log.warnf("shutdown abandoned %d queued and %d running analyses (in-memory, by design)", dropped,
-                running);
-        }
-    }
-
-    /** Authorizes, resolves the incident and queues the analysis. Unknown orders never reach the model. */
+    /** Authorizes, resolves the incident and queues the analysis on the shared model queue. Unknown orders never reach the model. */
     public Analysis submit(String incidentId) {
         guard.requireAnalyst();
         String orderId = Ids.orderOfIncident(incidentId);
@@ -115,9 +91,7 @@ public class AnalysisService {
         String subject = guard.subject();
         // Reserve the queue slot first: a BUSY rejection must never touch the store (review A-2).
         Runnable task = Context.current().wrap(() -> run(queued, subject));
-        try {
-            workers.execute(task);
-        } catch (RejectedExecutionException e) {
+        if (!gate.tryExecute(task)) {
             registry.counter("aiops_analyses_total", "status", "BUSY").increment();
             throw new Busy("analysis queue is full; retry later");
         }
@@ -128,6 +102,14 @@ public class AnalysisService {
 
     public Analysis get(String analysisId) {
         guard.requireViewer();
+        return getAuthorized(analysisId);
+    }
+
+    /**
+     * For a caller that already checked {@code requireViewer()} on its own request thread (the Assistant's tool loop
+     * runs on a model worker, which carries no request identity; D-016).
+     */
+    public Analysis getAuthorized(String analysisId) {
         Ids.analysis(analysisId);
         return store.get(analysisId).orElseThrow(() -> new NotFound("ANALYSIS_NOT_FOUND",
             "no analysis " + analysisId + "; analyses are kept in memory for " + config.analysis().ttl()
@@ -259,8 +241,8 @@ public class AnalysisService {
     }
 
     /** D-008 budget profiles. Evidence bytes approximate tokens at about three bytes per token. */
-    record Profile(String name, int evidenceBytes, int maxOutputTokens) {
-        static Profile of(String name) {
+    public record Profile(String name, int evidenceBytes, int maxOutputTokens) {
+        public static Profile of(String name) {
             return "16k".equalsIgnoreCase(name) ? new Profile("16k", 24_576, 2048)
                 : new Profile("32k", 49_152, 4096);
         }

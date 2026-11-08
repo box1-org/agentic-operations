@@ -13,6 +13,7 @@ public final class Ids {
     private static final Pattern FULFILLMENT = Pattern.compile("^ful_[A-Za-z0-9_-]{1,124}$");
     private static final Pattern CORRELATION = Pattern.compile("^[A-Za-z0-9._:-]{1,128}$");
     private static final Pattern RESERVATION = Pattern.compile("^res_[A-Za-z0-9_-]{1,124}$");
+    private static final Pattern CONVERSATION = Pattern.compile("^conv_[0-9a-f]{32}$");
 
     /** Services whose {@code /api/info} the deployed-revision evidence may read. */
     public static final Set<String> SERVICES = Set.of("order-service", "inventory-service", "fulfillment-adapter");
@@ -39,6 +40,10 @@ public final class Ids {
 
     public static String analysis(String value) {
         return require(ANALYSIS, value, "analysisId", "ana_<32 hex>");
+    }
+
+    public static String conversation(String value) {
+        return require(CONVERSATION, value, "conversationId", "conv_<32 hex>");
     }
 
     public static boolean isFulfillment(String value) {

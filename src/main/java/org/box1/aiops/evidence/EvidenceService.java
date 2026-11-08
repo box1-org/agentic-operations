@@ -80,41 +80,32 @@ public class EvidenceService {
 
     public EvidenceItem orderTimeline(String orderId) {
         guard.requireViewer();
-        Ids.order(orderId);
-        return timeline(orderId).withRef("ev_1");
+        return reads().orderTimeline(orderId);
     }
 
     public EvidenceItem fulfillmentStatus(String orderId) {
         guard.requireViewer();
-        Ids.order(orderId);
-        return fulfillment(orderId, window.forKey(orderId, EVENTS_MAX)).withRef("ev_1");
+        return reads().fulfillmentStatus(orderId);
     }
 
     public EvidenceItem inventoryReservation(String orderId) {
         guard.requireViewer();
-        Ids.order(orderId);
-        Fetch order = counted(ORDER, upstreams.order(orderId));
-        return reservation(orderId, order).withRef("ev_1");
+        return reads().inventoryReservation(orderId);
     }
 
     public EvidenceItem recentEvents(String key, Integer limit) {
         guard.requireViewer();
-        Ids.windowKey(key);
-        int size = limit == null ? EVENTS_DEFAULT : Math.max(1, Math.min(EVENTS_MAX, limit));
-        return events(key, window.forKey(key, size)).withRef("ev_1");
+        return reads().recentEvents(key, limit);
     }
 
     public EvidenceItem recentEventsByCorrelation(String correlationId, Integer limit) {
         guard.requireViewer();
-        Ids.correlation(correlationId);
-        int size = limit == null ? EVENTS_DEFAULT : Math.max(1, Math.min(EVENTS_MAX, limit));
-        return events("correlation:" + correlationId, window.forCorrelation(correlationId, size)).withRef("ev_1");
+        return reads().recentEventsByCorrelation(correlationId, limit);
     }
 
     public EvidenceItem deployedRevision(String service) {
         guard.requireViewer();
-        Ids.service(service);
-        return revision(service).withRef("ev_1");
+        return reads().deployedRevision(service);
     }
 
     public EvidenceItem telemetryAlerts(String assetId) {
@@ -123,6 +114,55 @@ public class EvidenceService {
             Ids.asset(assetId);
         }
         return telemetryUnavailable().withRef("ev_1");
+    }
+
+    /**
+     * The same single-source reads without the role check, for a caller that already ran {@code requireViewer()} on
+     * its own request thread: the Assistant's tool loop runs on a model worker, which carries no request identity
+     * (D-016). Arguments are still validated against the contract ID patterns before any upstream call.
+     */
+    public AuthorizedReads reads() {
+        return authorizedReads;
+    }
+
+    private final AuthorizedReads authorizedReads = new AuthorizedReads();
+
+    public final class AuthorizedReads {
+        private AuthorizedReads() {
+        }
+
+        public EvidenceItem orderTimeline(String orderId) {
+            Ids.order(orderId);
+            return timeline(orderId).withRef("ev_1");
+        }
+
+        public EvidenceItem fulfillmentStatus(String orderId) {
+            Ids.order(orderId);
+            return fulfillment(orderId, window.forKey(orderId, EVENTS_MAX)).withRef("ev_1");
+        }
+
+        public EvidenceItem inventoryReservation(String orderId) {
+            Ids.order(orderId);
+            Fetch order = counted(ORDER, upstreams.order(orderId));
+            return reservation(orderId, order).withRef("ev_1");
+        }
+
+        public EvidenceItem recentEvents(String key, Integer limit) {
+            Ids.windowKey(key);
+            int size = limit == null ? EVENTS_DEFAULT : Math.max(1, Math.min(EVENTS_MAX, limit));
+            return events(key, window.forKey(key, size)).withRef("ev_1");
+        }
+
+        public EvidenceItem recentEventsByCorrelation(String correlationId, Integer limit) {
+            Ids.correlation(correlationId);
+            int size = limit == null ? EVENTS_DEFAULT : Math.max(1, Math.min(EVENTS_MAX, limit));
+            return events("correlation:" + correlationId, window.forCorrelation(correlationId, size)).withRef("ev_1");
+        }
+
+        public EvidenceItem deployedRevision(String service) {
+            Ids.service(service);
+            return revision(service).withRef("ev_1");
+        }
     }
 
     // ---- bundle for an incident (caller already authorized) ------------------------------------------------------
