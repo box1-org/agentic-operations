@@ -6,7 +6,9 @@ import com.fasterxml.jackson.databind.JsonNode;
 public record Fetch(Status status, JsonNode body, String detail) {
 
     public enum Status {
-        OK, NOT_FOUND, UNAUTHORIZED, ERROR, TIMEOUT, UNREACHABLE, CONFLICTING
+        OK, NOT_FOUND, UNAUTHORIZED, ERROR, TIMEOUT, UNREACHABLE, CONFLICTING,
+        /** A gap the service declares itself (for example a source that is not configured); never degrading. */
+        UNAVAILABLE
     }
 
     public static Fetch ok(JsonNode body) {

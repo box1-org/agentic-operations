@@ -36,7 +36,7 @@ public class ToolAudit {
     }
 
     private static final java.util.regex.Pattern LOGGABLE =
-        java.util.regex.Pattern.compile("^(ord|inc_ord|asset|ana)_[A-Za-z0-9_-]{1,124}$|^[a-z][a-z-]{1,40}$");
+        java.util.regex.Pattern.compile("^(ord|inc_ord|asset|ana)_[A-Za-z0-9_-]{1,124}$|^[a-z][a-z-]{1,40}$|^[0-9a-f]{32}$");
 
     /** Only IDs of a known shape reach the audit log; anything else is logged as "invalid" (review S-5). */
     public static String loggableId(String id) {

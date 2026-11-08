@@ -2,6 +2,7 @@ package org.box1.aiops;
 
 import java.time.Duration;
 import java.util.List;
+import java.util.Optional;
 
 import io.smallrye.config.ConfigMapping;
 import io.smallrye.config.WithDefault;
@@ -21,6 +22,8 @@ public interface AiopsConfig {
     Window window();
 
     Evidence evidence();
+
+    Platform platform();
 
     Auth auth();
 
@@ -125,6 +128,43 @@ public interface AiopsConfig {
         /** Telemetry alerts need an asset-service read grant that v1 does not have (Q-5). */
         @WithDefault("false")
         boolean telemetryEnabled();
+    }
+
+    /**
+     * Platform evidence (box1-docs#111): Tempo traces, LokiStack logs, Thanos and Alertmanager tenancy reads, with the
+     * pod's own projected ServiceAccount token over TLS that trusts only the service CA. An unset URL or token leaves
+     * that source UNAVAILABLE ("not configured").
+     */
+    interface Platform {
+        Optional<String> tokenPath();
+
+        Optional<String> caPath();
+
+        Optional<String> tempoUrl();
+
+        Optional<String> lokiUrl();
+
+        Optional<String> thanosTenancyUrl();
+
+        Optional<String> alertmanagerTenancyUrl();
+
+        /** The namespaces an order's evidence covers; never taken from callers or the model. */
+        @WithDefault("order-service-dev,inventory-service-dev,fulfillment-adapter-dev")
+        List<String> orderNamespaces();
+
+        /** Raw platform responses are larger than service JSON; they are flattened before they become evidence. */
+        @WithDefault("524288")
+        int maxResponseBytes();
+
+        @WithDefault("8s")
+        Duration readTimeout();
+
+        @WithDefault("50")
+        int logLimit();
+
+        /** How far back a log search may reach (LokiStack keeps 3 days). */
+        @WithDefault("72h")
+        Duration logLookback();
     }
 
     interface Auth {

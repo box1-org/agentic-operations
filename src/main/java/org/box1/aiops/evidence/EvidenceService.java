@@ -108,6 +108,21 @@ public class EvidenceService {
         return reads().deployedRevision(service);
     }
 
+    public EvidenceItem traceContent(String traceId) {
+        guard.requireViewer();
+        return reads().traceContent(traceId);
+    }
+
+    public EvidenceItem searchLogs(String orderId, String traceId) {
+        guard.requireViewer();
+        return reads().searchLogs(orderId, traceId);
+    }
+
+    public EvidenceItem serviceAlerts(String service) {
+        guard.requireViewer();
+        return reads().serviceAlerts(service);
+    }
+
     public EvidenceItem telemetryAlerts(String assetId) {
         guard.requireViewer();
         if (assetId != null && !assetId.isBlank()) {
@@ -163,6 +178,29 @@ public class EvidenceService {
             Ids.service(service);
             return revision(service).withRef("ev_1");
         }
+
+        public EvidenceItem traceContent(String traceId) {
+            Ids.trace(traceId);
+            return readTrace(traceId).withRef("ev_1");
+        }
+
+        /** Exactly one of {@code orderId} or {@code traceId}; the namespaces are the configured order path only. */
+        public EvidenceItem searchLogs(String orderId, String traceId) {
+            boolean byOrder = orderId != null && !orderId.isBlank();
+            boolean byTrace = traceId != null && !traceId.isBlank();
+            if (byOrder == byTrace) {
+                throw new org.box1.aiops.InvalidArgument("INVALID_KEY", "give exactly one of orderId or traceId");
+            }
+            Instant from = now().minus(config.platform().logLookback());
+            return (byOrder ? logs("orderId", Ids.order(orderId), from) : logs("traceId", Ids.trace(traceId), from))
+                .withRef("ev_1");
+        }
+
+        public EvidenceItem serviceAlerts(String service) {
+            Ids.service(service);
+            String ns = namespaceOf(service);
+            return alerts(ns == null ? List.of() : List.of(ns)).withRef("ev_1");
+        }
     }
 
     // ---- bundle for an incident (caller already authorized) ------------------------------------------------------
@@ -183,13 +221,18 @@ public class EvidenceService {
         String traceId = order.isOk() ? text(order.body(), "traceId") : null;
         if (traceId != null && TRACE_ID.matcher(traceId).matches()) {
             items.add(new EvidenceItem(null, TRACE_REFERENCE, "order-service", instant(order.body(), "createdAt"),
-                now(), EvidenceItem.OK, "trace identifier only; contents are not readable in v1",
+                now(), EvidenceItem.OK, "trace identifier; its spans are in TRACE_CONTENT when Tempo is readable",
                 "tempo:dev/traces/" + traceId, false, F.objectNode().put("traceId", traceId)));
         }
         items.add(telemetryUnavailable());
-        items.add(unavailable(TRACE_CONTENT, "tempo", "no trace read access in v1 (box1-docs#20 Q-6)"));
-        items.add(unavailable(METRICS, "thanos-querier", "no metrics or alert read access in v1 (box1-docs#20 Q-6)"));
-        items.add(unavailable(LOGS, "none", "no centralized logging (box1-docs#82)"));
+        items.add(traceId != null && TRACE_ID.matcher(traceId).matches() ? readTrace(traceId)
+            : unavailable(TRACE_CONTENT, "tempo", "the order carries no trace ID"));
+        items.add(alerts(config.platform().orderNamespaces()));
+        Instant created = order.isOk() ? instant(order.body(), "createdAt") : null;
+        Instant earliest = now().minus(config.platform().logLookback());
+        Instant from = created == null || created.minusSeconds(300).isBefore(earliest) ? earliest
+            : created.minusSeconds(300);
+        items.add(logs("orderId", orderId, from));
 
         List<EvidenceItem> numbered = new ArrayList<>();
         for (int i = 0; i < items.size(); i++) {
@@ -263,6 +306,76 @@ public class EvidenceService {
             o.put("service", service);
             return o;
         }, b -> null);
+    }
+
+    // ---- platform sources (box1-docs#111): read with the service's own identity, never CORE ------------------------
+
+    private EvidenceItem readTrace(String traceId) {
+        Fetch fetch = counted(TRACE_CONTENT, upstreams.trace(traceId));
+        return item(TRACE_CONTENT, "tempo", "tempo:dev/traces/" + traceId, fetch,
+            b -> PlatformShapes.trace(traceId, b), b -> null);
+    }
+
+    private EvidenceItem logs(String field, String value, Instant from) {
+        List<String> namespaces = config.platform().orderNamespaces();
+        Fetch fetch = counted(LOGS, upstreams.logs(namespaces, field, value, from, now(), config.platform().logLimit()));
+        EvidenceItem out = item(LOGS, "lokistack", "lokistack:application/" + field + "=" + value, fetch,
+            b -> PlatformShapes.logs(b, json, config.platform().logLimit()), b -> lastInstant(
+                PlatformShapes.logs(b, json, config.platform().logLimit()), "timestamp"));
+        if (out.ok() && out.data() != null && out.data().isEmpty()) {
+            return new EvidenceItem(null, LOGS, out.source(), null, out.retrievedAt(), EvidenceItem.OK,
+                "no log lines with " + field + " " + value + " in " + String.join(", ", namespaces) + " since " + from,
+                out.link(), false, out.data());
+        }
+        return out;
+    }
+
+    /** Active alerts and down scrape targets for the given namespaces, as one item. */
+    private EvidenceItem alerts(List<String> namespaces) {
+        if (namespaces.isEmpty()) {
+            return unavailable(METRICS, "alertmanager", "no namespace is configured for this service");
+        }
+        ArrayNode alerts = F.arrayNode();
+        ArrayNode targets = F.arrayNode();
+        Fetch failed = null;
+        int ok = 0;
+        for (String ns : namespaces) {
+            Fetch a = counted(METRICS, upstreams.alerts(ns));
+            if (a.isOk()) {
+                ok++;
+                PlatformShapes.alerts(a.body()).forEach(alerts::add);
+            } else if (failed == null) {
+                failed = a;
+            }
+            Fetch t = counted(METRICS, upstreams.targets(ns));
+            if (t.isOk()) {
+                ok++;
+                targets.add(PlatformShapes.targets(ns, t.body()));
+            } else if (failed == null) {
+                failed = t;
+            }
+        }
+        if (ok == 0) {
+            return new EvidenceItem(null, METRICS, "alertmanager", null, now(), failed.status().name(), failed.detail(),
+                "alertmanager:" + String.join(",", namespaces), false, null);
+        }
+        ObjectNode data = F.objectNode();
+        data.set("alerts", alerts);
+        data.set("targets", targets);
+        int down = 0;
+        for (JsonNode t : targets) {
+            down += t.path("down").size();
+        }
+        String detail = alerts.size() + " active alert(s), " + down + " scrape target(s) down in "
+            + String.join(", ", namespaces) + (failed == null ? "" : "; some reads failed (" + failed.status() + ")");
+        return new EvidenceItem(null, METRICS, "alertmanager", null, now(), EvidenceItem.OK, detail,
+            "alertmanager:" + String.join(",", namespaces), false, data);
+    }
+
+    /** The configured namespace of an allowlisted service, or null when it is not on the order path. */
+    private String namespaceOf(String service) {
+        String ns = service + "-dev";
+        return config.platform().orderNamespaces().contains(ns) ? ns : null;
     }
 
     private EvidenceItem telemetryUnavailable() {
