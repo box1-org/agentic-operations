@@ -6,9 +6,12 @@ import java.util.function.Function;
 
 import jakarta.enterprise.context.ApplicationScoped;
 
+import org.box1.aiops.model.ChatRequest;
+import org.box1.aiops.model.ChatResult;
 import org.box1.aiops.model.ModelClient;
 import org.box1.aiops.model.ModelRequest;
 import org.box1.aiops.model.ModelResult;
+import org.box1.aiops.model.ToolCall;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -26,11 +29,17 @@ import io.quarkus.test.Mock;
 public class ScriptedModel implements ModelClient {
     public static final List<ModelRequest> REQUESTS = new CopyOnWriteArrayList<>();
     public static volatile Function<ModelRequest, ModelResult> script;
+    /** Chat calls (D-016), in order. */
+    public static final List<ChatRequest> CHAT_REQUESTS = new CopyOnWriteArrayList<>();
+    /** Chat behaviour; by default the model answers in text without calling a tool. */
+    public static volatile Function<ChatRequest, ChatResult> chatScript;
     private static final ObjectMapper JSON = new ObjectMapper();
 
     public static void reset() {
         REQUESTS.clear();
         script = null;
+        CHAT_REQUESTS.clear();
+        chatScript = null;
     }
 
     public static ModelResult content(String content) {
@@ -40,6 +49,25 @@ public class ScriptedModel implements ModelClient {
     @Override
     public String modelId() {
         return "scripted-test-model";
+    }
+
+    public static ChatResult text(String answer) {
+        return new ChatResult(ModelResult.Outcome.OK, answer, List.of(), "stop", 500, 50, null);
+    }
+
+    public static ChatResult tools(ToolCall... calls) {
+        return new ChatResult(ModelResult.Outcome.OK, null, List.of(calls), "tool_calls", 500, 30, null);
+    }
+
+    public static ToolCall call(String id, String name, String argumentsJson) {
+        return new ToolCall(id, name, argumentsJson);
+    }
+
+    @Override
+    public ChatResult chat(ChatRequest request) {
+        CHAT_REQUESTS.add(request);
+        Function<ChatRequest, ChatResult> s = chatScript;
+        return s != null ? s.apply(request) : text("I can answer that without reading anything.");
     }
 
     @Override

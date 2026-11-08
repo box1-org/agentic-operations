@@ -16,6 +16,8 @@ public interface AiopsConfig {
 
     Analysis analysis();
 
+    Chat chat();
+
     Window window();
 
     Evidence evidence();
@@ -69,6 +71,37 @@ public interface AiopsConfig {
         /** Same default as the console's {@code console.stuck-threshold}. */
         @WithDefault("10m")
         Duration stuckThreshold();
+    }
+
+    /** The Assistant's chat turns (D-016). They share the model queue with analyses. */
+    interface Chat {
+        @WithDefault("200")
+        int maxConversations();
+
+        /** Idle time after which a conversation is forgotten. */
+        @WithDefault("2h")
+        Duration ttl();
+
+        @WithDefault("20")
+        int maxTurns();
+
+        @WithDefault("2000")
+        int messageMaxChars();
+
+        /** Tool calls per turn; further calls are answered with a limit error and the model must answer. */
+        @WithDefault("8")
+        int maxToolCalls();
+
+        /** Model calls per turn that may request tools; one final call without tools may follow. */
+        @WithDefault("4")
+        int maxModelRounds();
+
+        /** Wall-clock limit for one turn, including every model and tool call. */
+        @WithDefault("90s")
+        Duration turnDeadline();
+
+        @WithDefault("1024")
+        int answerMaxTokens();
     }
 
     interface Window {

@@ -332,8 +332,9 @@ class AnalysisApiTest {
                 assertFalse(ops.containsKey(verb), verb + " " + path);
             }
             if (path.startsWith("/api/v1/ai")) {
-                assertTrue(Set.of("/api/v1/ai/incidents/{incidentId}/analyze", "/api/v1/ai/analyses/{analysisId}")
-                    .contains(path), path);
+                assertTrue(Set.of("/api/v1/ai/incidents/{incidentId}/analyze", "/api/v1/ai/analyses/{analysisId}",
+                    "/api/v1/ai/conversations", "/api/v1/ai/conversations/{conversationId}",
+                    "/api/v1/ai/conversations/{conversationId}/messages").contains(path), path);
             }
         });
     }
