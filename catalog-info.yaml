@@ -35,11 +35,26 @@ metadata:
 spec:
   type: service
   lifecycle: experimental
-  owner: "user:default/mike4263"
-  # Add when the corresponding System entity exists:
-  # system: box1-demo
+  owner: "user:default/mike"
+  system: box1-operations
   providesApis:
     - agentic-operations-api
+  consumesApis:
+    - order-service-api
+    - inventory-service-api
+    - fulfillment-adapter-api
+    - box1-order-events
+    - box1-inventory-events
+    - box1-fulfillment-events
+    - box1-telemetry-events
+    - box1-notification-events
+  dependsOn:
+    - component:order-service
+    - component:inventory-service
+    - component:fulfillment-adapter
+    - resource:box1-kafka
+    - resource:vllm-test-2
+    - resource:keycloak-box1
 ---
 apiVersion: backstage.io/v1alpha1
 kind: API
@@ -50,6 +65,7 @@ metadata:
 spec:
   type: openapi
   lifecycle: experimental
-  owner: "user:default/mike4263"
+  owner: "user:default/mike"
+  system: box1-operations
   definition:
     $text: https://agentic-operations-dev.apps.ocp.box1.org/q/openapi

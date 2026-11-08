@@ -5,7 +5,7 @@ Evidence-grounded incident analysis over REST and MCP for box1 Operations. See [
 
 AI Enabled Operations
 
-Owner: `user:default/mike4263`. Quarkus 3.40.1.1, Java 21, Maven 3.9.16.
+Owner: `user:default/mike`. Quarkus 3.40.1.1, Java 21, Maven 3.9.16.
 
 Optional integrations selected at creation: PostgreSQL = `false`, Kafka = `true`.
 The integrations add their Quarkus extensions and GitOps resources. PostgreSQL creates a
