@@ -35,6 +35,9 @@ The service is **read and propose only**:
 | `get_deployed_revision` | viewer | order-service, inventory-service, fulfillment-adapter |
 | `analyze_incident` | analyst | same as the REST POST |
 | `get_analysis` | viewer | same as the REST GET |
+| `get_trace` | viewer | Tempo trace summary: services, root span, duration, error and slowest spans (box1-docs#111) |
+| `search_logs` | viewer | LokiStack lines for one `orderId` or `traceId` in the order-path namespaces, last 72 h, at most 50 |
+| `list_service_alerts` | viewer | Active alerts and down scrape targets for one allowlisted service's namespace |
 
 The server exposes tools only: no resources, prompts or sampling. Every result is wrapped as `{"untrusted": true, "result": ...}`.
 
@@ -58,7 +61,7 @@ Other responses:
 
 A message is answered on the shared model queue by a bounded loop:
 
-- The model may call `get_order_timeline`, `get_fulfillment_status`, `get_inventory_reservation`, `list_recent_events`, `get_deployed_revision` and `get_analysis`. These are the same reads as the MCP tools.
+- The model may call `get_order_timeline`, `get_fulfillment_status`, `get_inventory_reservation`, `list_recent_events`, `get_deployed_revision`, `get_analysis`, `get_trace`, `search_logs` and `list_service_alerts`. These are the same reads as the MCP tools.
 - It cannot start an analysis, and nothing it can call writes, executes, runs a shell, calls the Kubernetes API or fetches a URL.
 - Every argument is validated against the contract ID patterns before any read. An unknown tool or an invalid argument comes back to the model as an error, with no read made.
 - Every result is wrapped as untrusted data and capped at `source-max-bytes`.
@@ -103,7 +106,7 @@ Each step records `tool`, `target` (a validated ID only), `decision` (`ok`, `inv
     - The model chooses among the read-only tools above, so injected text in evidence can steer which reads happen.
     - Every read is still validated, read-only, limited by the per-message budget, and within what the asking person may already see.
     - Answers return only to that person, and no tool can send data elsewhere.
-    - The system policy `aiops-chat-policy-1` tells the model to treat tool results as data and never to claim it did anything.
+    - The system policy `aiops-chat-policy-2` tells the model to treat tool results as data and never to claim it did anything. It also says only an `OK` read counts as checked: `UNAVAILABLE`, `UNAUTHORIZED` and other failures are "could not check", never "no record". This follows the 2026-11-08 live check (box1-docs#101).
     - Answers are model text and can be wrong; the console labels them so.
   - Output must match the schema. Findings without valid citations, and actions outside the allowlist, are dropped and counted. If every finding is dropped, the model's summary is replaced with a fixed "no supported diagnosis" text.
 - **Logs:** prompts, completions, chat questions and answers, evidence and reasoning output are never logged. Logs carry IDs, outcomes, token counts and durations. The audit log records a caller-supplied ID only when it has a known shape.
@@ -123,6 +126,9 @@ Each step records `tool`, `target` (a validated ID only), `decision` (`ok`, `inv
 | `AIOPS_CONSUMER_GROUP` | `agentic-operations` | One declared group per environment. The window is per pod |
 | `OIDC_AUTH_SERVER_URL` | box1 realm | Token issuer |
 | `AIOPS_ALLOWED_AZP` | `agentic-operations-cli` | Accepted clients, comma-separated |
+| `AIOPS_PLATFORM_TOKEN_PATH`, `AIOPS_PLATFORM_CA_PATH` | unset | Projected ServiceAccount token and service CA for platform reads (box1-docs#111). Unset means trace, log and alert evidence is `UNAVAILABLE` ("not configured") |
+| `AIOPS_TEMPO_URL`, `AIOPS_LOKI_URL`, `AIOPS_THANOS_TENANCY_URL`, `AIOPS_ALERTMANAGER_TENANCY_URL` | unset | Tempo gateway (tenant `dev`), LokiStack gateway (tenant `application`), Thanos querier tenancy port 9092 and Alertmanager tenancy port 9095 |
+| `AIOPS_PLATFORM_ORDER_NAMESPACES` | order, inventory and fulfillment-adapter `-dev` | The namespaces whose logs and alerts an order's evidence covers. Never taken from callers or the model |
 | `AIOPS_ANALYSIS_*`, `AIOPS_WINDOW_*` | see `AiopsConfig` | Cache size and TTL (200, 24h), concurrency 1, queue 4, window age 6h, 20,000 events, 200 per key |
 
 ## Kafka evidence window
@@ -165,9 +171,12 @@ Each step records `tool`, `target` (a validated ID only), `decision` (`ok`, `inv
 - `quarkus-mcp-server` 2.0.4 is built against Quarkus 3.33.3.1. On Quarkus 3.40.1.1 it is **tested, not declared compatible**. Check again when either is upgraded.
 - The release smoke test (`box1-quarkus-smoke`) checks only the template endpoints. The 401s on `/api/v1/ai/*` and `/mcp`, and the new OpenAPI paths, are checked by hand at live acceptance.
 
-- Evidence that is unavailable in v1, each listed in `unknowns`:
-  - telemetry alerts: no asset-service read grant;
-  - trace contents, metrics and alerts: no read RBAC. The trace ID is still cited as a reference;
-  - logs (box1-docs#82).
+- **Platform evidence** (box1-docs#111) is read with the service's own projected ServiceAccount token over TLS that trusts only the service CA.
+  - **Sources:** `TRACE_CONTENT` (Tempo), `LOGS` (LokiStack) and `METRICS_AND_ALERTS` (Alertmanager active alerts, plus `up` from the Thanos querier, both per namespace).
+  - **Scope:** RBAC limits these reads to the Box1 service namespaces: `box1-observability-reader` and `monitoring-rules-view` RoleBindings in box1-workloads-dev, plus `box1-traces-read-dev` and `cluster-logging-application-view` in box1-gitops.
+  - **Not CORE:** a refusal or failure is shown, as `UNAUTHORIZED`, `UNREACHABLE` and so on, and listed in `unknowns`. It never degrades an analysis.
+  - **Untrusted text:** log lines and span names are written by services, so they are treated as untrusted data, like Kafka payloads. Only named fields survive, each cut to 256 characters.
+- **Still unavailable:** telemetry alerts from asset-service. They need a confidential Keycloak client and `ASSET_READ_CLIENTS` (box1-docs#20 Q-5). Threshold alerts may still appear in the event window.
+- **agentic-operations' own logs** are not collected into LokiStack.
 - The timeline is the first 50 entries, oldest first.
 - `fulfillmentRequestId` is known only while its events are in the window (box1-docs#78).

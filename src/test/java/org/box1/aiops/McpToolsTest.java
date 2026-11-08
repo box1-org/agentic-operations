@@ -32,7 +32,7 @@ import io.restassured.path.json.JsonPath;
 class McpToolsTest {
     static final Set<String> CATALOG = Set.of("get_order_timeline", "get_fulfillment_status",
         "get_inventory_reservation", "list_recent_events", "list_telemetry_alerts", "get_deployed_revision",
-        "analyze_incident", "get_analysis");
+        "analyze_incident", "get_analysis", "get_trace", "search_logs", "list_service_alerts");
 
     @Inject
     EvidenceWindow window;

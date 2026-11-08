@@ -71,6 +71,26 @@ public class AiopsTools {
         return audit.call("get_deployed_revision", service, () -> evidence.deployedRevision(service));
     }
 
+    @Tool(name = "get_trace", description = "Read-only. Summary of one distributed trace from Tempo (tenant dev): "
+        + "services, root span, duration, error and slowest spans. Requires aiops-viewer.")
+    String getTrace(@ToolArg(description = "Trace ID, 32 lower-case hex characters") String traceId) {
+        return audit.call("get_trace", traceId, () -> evidence.traceContent(traceId));
+    }
+
+    @Tool(name = "search_logs", description = "Read-only. Log lines from the box1 order-path services in LokiStack "
+        + "for one order ID or one trace ID (exactly one), last 72 hours, at most 50. Requires aiops-viewer.")
+    String searchLogs(@ToolArg(description = "Order ID, ord_...", required = false) String orderId,
+            @ToolArg(description = "Trace ID, 32 hex", required = false) String traceId) {
+        return audit.call("search_logs", orderId != null ? orderId : traceId,
+            () -> evidence.searchLogs(orderId, traceId));
+    }
+
+    @Tool(name = "list_service_alerts", description = "Read-only. Active alerts and down scrape targets for one "
+        + "service's namespace: order-service, inventory-service or fulfillment-adapter. Requires aiops-viewer.")
+    String listServiceAlerts(@ToolArg(description = "Service name") String service) {
+        return audit.call("list_service_alerts", service, () -> evidence.serviceAlerts(service));
+    }
+
     @Tool(name = "analyze_incident", description = "Queue this service's evidence-grounded analysis of an "
         + "incident (inc_<orderId>). Returns an analysisId to read with get_analysis. Proposes actions only; never "
         + "executes anything. Requires aiops-analyst.")
