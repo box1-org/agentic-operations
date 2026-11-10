@@ -131,6 +131,15 @@ Each step records `tool`, `target` (a validated ID only), `decision` (`ok`, `inv
 | `AIOPS_PLATFORM_ORDER_NAMESPACES` | order, inventory and fulfillment-adapter `-dev` | The namespaces whose logs and alerts an order's evidence covers. Never taken from callers or the model |
 | `AIOPS_ANALYSIS_*`, `AIOPS_WINDOW_*` | see `AiopsConfig` | Cache size and TTL (200, 24h), concurrency 1, queue 4, window age 6h, 20,000 events, 200 per key |
 
+### Model client
+
+`ModelClient` is implemented with LangChain4j's OpenAI-compatible chat model (`langchain4j-open-ai`, version from the Quarkus platform's `quarkus-langchain4j-bom`). It uses the plain library, not the `quarkus-langchain4j` extension, and only its low-level chat call. LangChain4j never runs a tool: `ChatService` decides which tool calls run.
+
+- **Transport:** requests go through `BoundedHttpClient`, which uses `BoundedHttp`. That gives HTTP/1.1 only (vLLM answers HTTP 400 to an h2c upgrade offer), no redirects, one deadline over headers and body, and a 256 KiB response cap. No credential is sent, and trace headers are added.
+- **Request settings:** retries are off, request and response logging is off, and reasoning output is not returned. Every request sets `temperature 0` and `chat_template_kwargs.enable_thinking=false`. Analyses use strict `json_schema` output.
+- **Tool schemas:** these are sent without `additionalProperties`, because LangChain4j adds it only for strict tools. Strict tools would make every parameter required, and `search_logs` takes either `orderId` or `traceId`. `ChatTools` reads only the keys it knows and validates each value.
+- **Live check:** `AIOPS_LIVE_MODEL_URL=https://<vllm-route>/v1 ./mvnw test -Dtest=LiveModelTest` runs both calls against a real vLLM endpoint with the production prompts and schemas. It is skipped when the variable is unset.
+
 ## Kafka evidence window
 
 - **Topics:** consumer group `agentic-operations` (`AIOPS_CONSUMER_GROUP`) on the five `box1.*.events.v1` topics. DLQs are not read. Run **one replica with the `Recreate` strategy**: with two pods in the group, each holds only part of the partitions.

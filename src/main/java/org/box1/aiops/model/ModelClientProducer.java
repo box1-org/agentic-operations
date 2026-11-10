@@ -19,7 +19,7 @@ public class ModelClientProducer {
     @ApplicationScoped
     ModelClient modelClient(AiopsConfig config, ObjectMapper json, OpenTelemetry otel) {
         AiopsConfig.Model m = config.model();
-        return new VllmModelClient(m.baseUrl(), m.id(), m.connectTimeout(), m.timeout(), json,
+        return new LangChain4jModelClient(m.baseUrl(), m.id(), m.connectTimeout(), m.timeout(), json,
             b -> otel.getPropagators().getTextMapPropagator().inject(Context.current(), b, HttpRequest.Builder::header));
     }
 }

@@ -10,6 +10,7 @@ import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
 import org.box1.aiops.model.ChatMessage;
@@ -22,21 +23,39 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.sun.net.httpserver.HttpServer;
 
-/** The vLLM client against a local fake OpenAI-compatible server. */
-class VllmModelClientTest {
+/** The LangChain4j model client against a local fake OpenAI-compatible (vLLM) server. */
+class LangChain4jModelClientTest {
     static final ObjectMapper JSON = new ObjectMapper();
+    /** Shaped like ChatTools' schemas: string properties with descriptions and a pattern, all required, closed. */
+    static final JsonNode TOOL_SCHEMA = read("""
+        {"type":"object","properties":{"orderId":{"type":"string","description":"Order id.",
+        "pattern":"^ord_[a-z0-9]+$","maxLength":64}},"required":["orderId"],"additionalProperties":false}""");
+
+    static JsonNode read(String s) {
+        try {
+            return JSON.readTree(s);
+        } catch (IOException e) {
+            throw new IllegalStateException(e);
+        }
+    }
     HttpServer server;
     final AtomicReference<String> reply = new AtomicReference<>();
     final AtomicReference<Integer> status = new AtomicReference<>(200);
     final AtomicReference<Long> delayMs = new AtomicReference<>(0L);
     final AtomicReference<JsonNode> lastRequest = new AtomicReference<>();
     final AtomicReference<String> upgradeHeader = new AtomicReference<>();
+    final AtomicReference<String> authorizationHeader = new AtomicReference<>();
+    final AtomicReference<String> traceHeader = new AtomicReference<>();
+    final AtomicInteger requests = new AtomicInteger();
 
     @BeforeEach
     void start() throws IOException {
         server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
         server.createContext("/v1/chat/completions", exchange -> {
+            requests.incrementAndGet();
             upgradeHeader.set(exchange.getRequestHeaders().getFirst("Upgrade"));
+            authorizationHeader.set(exchange.getRequestHeaders().getFirst("Authorization"));
+            traceHeader.set(exchange.getRequestHeaders().getFirst("traceparent"));
             lastRequest.set(JSON.readTree(exchange.getRequestBody()));
             try {
                 Thread.sleep(delayMs.get());
@@ -57,8 +76,8 @@ class VllmModelClientTest {
         server.stop(0);
     }
 
-    VllmModelClient client(Duration timeout) {
-        return new VllmModelClient("http://127.0.0.1:" + server.getAddress().getPort() + "/v1", "box1-coder",
+    LangChain4jModelClient client(Duration timeout) {
+        return new LangChain4jModelClient("http://127.0.0.1:" + server.getAddress().getPort() + "/v1", "box1-coder",
             Duration.ofSeconds(1), timeout, JSON);
     }
 
@@ -89,6 +108,50 @@ class VllmModelClientTest {
         assertFalse(sent.has("tool_choice"));
         assertEquals("system", sent.path("messages").path(0).path("role").asText());
         assertEquals(512, sent.path("max_tokens").asInt());
+        assertEquals(0, sent.path("temperature").asInt(-1));
+        JsonNode schema = sent.path("response_format").path("json_schema");
+        assertEquals("incident_analysis", schema.path("name").asText());
+        assertTrue(schema.path("strict").asBoolean(), "guided JSON is strict");
+        assertEquals(request().responseSchema(), schema.path("schema"), "the schema is sent verbatim");
+        assertEquals(false, sent.path("chat_template_kwargs").path("enable_thinking").asBoolean(true));
+        assertFalse(sent.path("stream").asBoolean(false));
+    }
+
+    @Test
+    void sendsNoCredentialAndAddsTraceHeaders() {
+        reply.set(completion("{}", "stop", null));
+        new LangChain4jModelClient("http://127.0.0.1:" + server.getAddress().getPort() + "/v1", "box1-coder",
+            Duration.ofSeconds(1), Duration.ofSeconds(5), JSON,
+            b -> b.header("traceparent", "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01")).complete(request());
+        assertEquals(null, authorizationHeader.get());
+        assertEquals("00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01", traceHeader.get());
+    }
+
+    @Test
+    void failedCallsAreNotRetried() {
+        reply.set("{}");
+        status.set(503);
+        client(Duration.ofSeconds(5)).complete(request());
+        status.set(429);
+        client(Duration.ofSeconds(5)).chat(chatRequest(true));
+        assertEquals(2, requests.get());
+    }
+
+    @Test
+    void oversizedResponseIsInvalid() {
+        reply.set(completion("x".repeat(BoundedHttpClient.MAX_RESPONSE_BYTES + 1), "stop", null));
+        ModelResult r = client(Duration.ofSeconds(5)).complete(request());
+        assertEquals(ModelResult.Outcome.INVALID, r.outcome());
+        assertTrue(r.detail().contains("too large"));
+    }
+
+    @Test
+    void toolSchemaKeywordsThatCannotBeCarriedAreRefused() {
+        reply.set(completion("unused", "stop", null));
+        ChatRequest refs = new ChatRequest(java.util.List.of(ChatMessage.user("q")), java.util.List.of(
+            new ToolSpec("t", "d", JSON.createObjectNode().put("type", "object").put("$ref", "#/x"))), 64);
+        assertEquals(ModelResult.Outcome.INVALID, client(Duration.ofSeconds(5)).chat(refs).outcome());
+        assertEquals(0, requests.get(), "nothing is sent with a loosened schema");
     }
 
     /** vLLM answered HTTP 400 to every request while the JDK client offered an h2c upgrade (live probe 2026-11-06). */
@@ -120,8 +183,8 @@ class VllmModelClientTest {
         return new ChatRequest(java.util.List.of(ChatMessage.system("policy"), ChatMessage.user("question"),
             ChatMessage.assistant(null, java.util.List.of(new ToolCall("c0", "get_order_timeline", "{\"orderId\":\"ord_1\"}"))),
             ChatMessage.tool("c0", "{\"untrusted\":true}")),
-            withTools ? java.util.List.of(new ToolSpec("get_order_timeline", "Read-only.",
-                JSON.createObjectNode().put("type", "object"))) : java.util.List.of(), 256);
+            withTools ? java.util.List.of(new ToolSpec("get_order_timeline", "Read-only.", TOOL_SCHEMA))
+                : java.util.List.of(), 256);
     }
 
     @Test
@@ -136,6 +199,11 @@ class VllmModelClientTest {
         JsonNode sent = lastRequest.get();
         assertEquals("get_order_timeline", sent.path("tools").path(0).path("function").path("name").asText());
         assertEquals("auto", sent.path("tool_choice").asText());
+        JsonNode parameters = sent.path("tools").path(0).path("function").path("parameters");
+        assertEquals(TOOL_SCHEMA.path("properties"), parameters.path("properties"), "property schemas are verbatim");
+        assertEquals(TOOL_SCHEMA.path("required"), parameters.path("required"));
+        assertTrue(sent.path("tools").path(0).path("function").path("strict").isMissingNode(),
+            "strict tools would make every parameter required");
         assertTrue(sent.path("response_format").isMissingNode(), "chat answers in text");
         assertEquals("tool", sent.path("messages").path(3).path("role").asText());
         assertEquals("c0", sent.path("messages").path(3).path("tool_call_id").asText());
@@ -199,7 +267,7 @@ class VllmModelClientTest {
         try (ServerSocket s = new ServerSocket(0)) {
             port = s.getLocalPort();
         }
-        VllmModelClient down = new VllmModelClient("http://127.0.0.1:" + port + "/v1", "box1-coder",
+        LangChain4jModelClient down = new LangChain4jModelClient("http://127.0.0.1:" + port + "/v1", "box1-coder",
             Duration.ofMillis(500), Duration.ofSeconds(1), JSON);
         assertEquals(ModelResult.Outcome.UNAVAILABLE, down.complete(request()).outcome());
     }
