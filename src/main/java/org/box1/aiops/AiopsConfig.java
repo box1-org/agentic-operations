@@ -33,7 +33,7 @@ public interface AiopsConfig {
 
     /** Langfuse export of the AI spans. Both keys unset means nothing is sent to Langfuse. */
     interface Langfuse {
-        @WithDefault("https://us.cloud.langfuse.com")
+        @WithDefault("https://langfuse.apps.ocp.box1.org")
         String baseUrl();
 
         Optional<String> publicKey();

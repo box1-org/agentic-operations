@@ -31,7 +31,7 @@ import io.restassured.path.json.JsonPath;
  * the OpenTelemetry SDK on and the Langfuse export configured, then flushes the spans. The traces are then checked in
  * Langfuse (trace names {@code analyze-incident} and {@code answer-message}, environment {@code test}). Opt-in: set
  * {@code AIOPS_LIVE_MODEL_URL}, {@code AIOPS_LIVE_LANGFUSE=true}, {@code LANGFUSE_PUBLIC_KEY} and
- * {@code LANGFUSE_SECRET_KEY} (and {@code LANGFUSE_BASE_URL} if not US cloud). Upstream services are the test fakes.
+ * {@code LANGFUSE_SECRET_KEY} (and {@code LANGFUSE_BASE_URL} if not the box1 instance). Upstream services are the test fakes.
  */
 @QuarkusTest
 @TestProfile(LiveLangfuseTest.Live.class)

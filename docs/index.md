@@ -132,7 +132,7 @@ Each step records `tool`, `target` (a validated ID only), `decision` (`ok`, `inv
 | `AIOPS_PLATFORM_ORDER_NAMESPACES` | order, inventory and fulfillment-adapter `-dev` | The namespaces whose logs and alerts an order's evidence covers. Never taken from callers or the model |
 | `AIOPS_ANALYSIS_*`, `AIOPS_WINDOW_*` | see `AiopsConfig` | Cache size and TTL (200, 24h), concurrency 1, queue 4, window age 6h, 20,000 events, 200 per key |
 | `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY` | unset | Langfuse project key pair. With both set, AI spans also go to Langfuse. Unset means nothing is sent there. Mount them from a Secret |
-| `LANGFUSE_BASE_URL` | `https://us.cloud.langfuse.com` | Langfuse host (US cloud, EU `https://cloud.langfuse.com`, or self-hosted) |
+| `LANGFUSE_BASE_URL` | `https://langfuse.apps.ocp.box1.org` | Langfuse host: the box1 instance (box1-gitops `platform/langfuse`, project `box1-default`; in-cluster callers use this public route). Langfuse Cloud is `https://us.cloud.langfuse.com` or `https://cloud.langfuse.com` |
 | `LANGFUSE_TRACING_ENVIRONMENT` | `default` (`development` in dev mode, `test` in tests) | Langfuse environment of every AI trace, for example `dev` or `production`. Lowercase letters, digits, `-` and `_` |
 | `AIOPS_TRACE_CONTENT` | unset: on when a Langfuse key is set | `true` or `false`: record prompts, evidence, completions, questions, answers and tool results on AI spans |
 
