@@ -6,6 +6,7 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.HexFormat;
 import java.util.List;
+import java.util.Map;
 
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
@@ -27,14 +28,13 @@ import org.box1.aiops.model.ChatResult;
 import org.box1.aiops.model.ModelClient;
 import org.box1.aiops.model.ToolCall;
 import org.box1.aiops.security.Guard;
+import org.box1.aiops.tracing.AiTracing;
 
 import org.jboss.logging.MDC;
 
 import io.micrometer.core.instrument.MeterRegistry;
 import io.micrometer.core.instrument.Timer;
 import io.opentelemetry.api.trace.Span;
-import io.opentelemetry.api.trace.StatusCode;
-import io.opentelemetry.api.trace.Tracer;
 import io.opentelemetry.context.Context;
 import io.opentelemetry.context.Scope;
 import io.quarkus.logging.Log;
@@ -48,6 +48,8 @@ import io.quarkus.logging.Log;
 @ApplicationScoped
 public class ChatService {
     private static final SecureRandom RANDOM = new SecureRandom();
+    /** Trace and root span name: stable, it is what Langfuse filters, evaluators and dashboards match on. */
+    static final String TRACE = "answer-message";
 
     private final Guard guard;
     private final ModelClient model;
@@ -55,20 +57,20 @@ public class ChatService {
     private final ModelGate gate;
     private final AiopsConfig config;
     private final MeterRegistry registry;
-    private final Tracer tracer;
+    private final AiTracing tracing;
     private final Clock clock = Clock.systemUTC();
     private final ConversationStore store;
 
     @Inject
     public ChatService(Guard guard, ModelClient model, ChatTools tools, ModelGate gate, AiopsConfig config,
-            MeterRegistry registry, Tracer tracer) {
+            MeterRegistry registry, AiTracing tracing) {
         this.guard = guard;
         this.model = model;
         this.tools = tools;
         this.gate = gate;
         this.config = config;
         this.registry = registry;
-        this.tracer = tracer;
+        this.tracing = tracing;
         this.store = new ConversationStore(clock, config.chat().ttl(), config.chat().maxConversations());
     }
 
@@ -154,22 +156,28 @@ public class ChatService {
 
     private void run(String conversationId, String turnId, String subject) {
         Timer.Sample sample = Timer.start(registry);
-        Span span = tracer.spanBuilder("aiops.chat.turn").setAttribute("aiops.conversation_id", conversationId)
-            .setAttribute("aiops.turn_id", turnId).startSpan();
+        AiTracing.TraceInfo info = new AiTracing.TraceInfo(TRACE, subject, conversationId, List.of("assistant"),
+            Map.of("conversation_id", conversationId, "turn_id", turnId, "policy_version", ChatPrompt.POLICY_VERSION));
+        Span span = tracing.startTrace(TRACE, AiTracing.Type.AGENT, info);
+        span.setAttribute("aiops.conversation_id", conversationId);
+        span.setAttribute("aiops.turn_id", turnId);
         MDC.put("conversationId", conversationId);
         Tally tally = new Tally();
         Status status;
         String detail = null;
         String answer = null;
-        try (Scope ignored = span.makeCurrent()) {
+        try (Scope ignored = tracing.context(span, info).makeCurrent()) {
             Conversation c = store.update(conversationId, conv -> conv.withTurn(turnId,
                 t -> t.with(Status.RUNNING, null, null, List.of(), null, null), clock.instant())).orElse(null);
             if (c == null) {
                 // Evicted while queued: nothing to answer into.
+                tracing.level(span, AiTracing.Level.WARNING, "conversation evicted while queued");
                 span.end();
                 MDC.remove("conversationId");
                 return;
             }
+            Turn current = c.turns().stream().filter(t -> t.turnId().equals(turnId)).findFirst().orElse(null);
+            tracing.contentInput(span, () -> current == null ? "" : current.question());
             Answer a = answer(conversationId, turnId, c, tally);
             status = a.status();
             detail = a.detail();
@@ -177,7 +185,6 @@ public class ChatService {
         } catch (RuntimeException e) {
             Log.errorf("chat turn %s/%s failed: %s at %s", conversationId, turnId, e.getClass().getSimpleName(),
                 where(e));
-            span.setStatus(StatusCode.ERROR);
             status = Status.FAILED;
             detail = "internal error";
         }
@@ -188,6 +195,7 @@ public class ChatService {
         store.update(conversationId, conv -> conv.withTurn(turnId, t -> t.with(s, d, s.answered() ? text : null,
             List.copyOf(tally.steps), use(tally), done), done));
         span.setAttribute("aiops.status", s.name());
+        record(span, s, d, text, tally);
         span.end();
         sample.stop(registry.timer("aiops_chat_turn_duration_seconds", "status", s.name()));
         registry.counter("aiops_chat_turns_total", "status", s.name()).increment();
@@ -198,6 +206,22 @@ public class ChatService {
     }
 
     private record Answer(Status status, String detail, String text) {
+    }
+
+    /** The trace's output is the answer (content); status, detail and counts are always recorded. */
+    private void record(Span span, Status s, String detail, String text, Tally tally) {
+        tracing.metadata(span, "status", s.name());
+        tracing.metadata(span, "model_calls", tally.modelCalls);
+        tracing.metadata(span, "tool_calls", tally.toolCalls);
+        if (s.answered() && text != null) {
+            tracing.contentOutput(span, () -> text);
+        }
+        switch (s) {
+            case COMPLETED -> {
+            }
+            case LIMIT_REACHED -> tracing.level(span, AiTracing.Level.WARNING, detail);
+            default -> tracing.level(span, AiTracing.Level.ERROR, detail);
+        }
     }
 
     private Answer answer(String conversationId, String turnId, Conversation c, Tally tally) {
@@ -266,9 +290,21 @@ public class ChatService {
                 "-", "limit", null);
         } else {
             tally.toolCalls++;
-            Span span = tracer.spanBuilder("aiops.chat.tool").setAttribute("aiops.tool", tool).startSpan();
+            // Every tool is a read-only lookup, so the observation is a retriever, named after the tool.
+            Span span = tracing.start(tool, AiTracing.Type.RETRIEVER);
+            span.setAttribute("aiops.tool", tool);
+            tracing.metadata(span, "tool_call_id", call.id());
+            tracing.contentInput(span, () -> call.argumentsJson());
             try (Scope ignored = span.makeCurrent()) {
                 out = tools.call(call.name(), call.argumentsJson());
+                ChatTools.Outcome o = out;
+                tracing.contentOutput(span, () -> o.text());
+                tracing.metadata(span, "decision", out.decision());
+                tracing.metadata(span, "target", out.target());
+                tracing.metadata(span, "retrieval_status", out.retrievalStatus());
+                if (!"ok".equals(out.decision())) {
+                    tracing.level(span, AiTracing.Level.WARNING, "tool call " + out.decision());
+                }
             } finally {
                 span.end();
             }

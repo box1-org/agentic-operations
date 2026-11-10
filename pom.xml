@@ -116,6 +116,27 @@
             <groupId>io.quarkus</groupId>
             <artifactId>quarkus-opentelemetry</artifactId>
         </dependency>
+        <!-- Langfuse: a second OTLP/HTTP span export carrying only the AI spans (LangfuseSpanProcessor), alongside the
+             collector export. The JDK sender keeps OkHttp off the classpath. -->
+        <dependency>
+            <groupId>io.opentelemetry</groupId>
+            <artifactId>opentelemetry-exporter-otlp</artifactId>
+            <exclusions>
+                <exclusion>
+                    <groupId>io.opentelemetry</groupId>
+                    <artifactId>opentelemetry-exporter-sender-okhttp</artifactId>
+                </exclusion>
+            </exclusions>
+        </dependency>
+        <dependency>
+            <groupId>io.opentelemetry</groupId>
+            <artifactId>opentelemetry-exporter-sender-jdk</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.opentelemetry</groupId>
+            <artifactId>opentelemetry-sdk-testing</artifactId>
+            <scope>test</scope>
+        </dependency>
         <dependency>
             <groupId>io.quarkus</groupId>
             <artifactId>quarkus-junit</artifactId>
