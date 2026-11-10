@@ -27,6 +27,35 @@ public interface AiopsConfig {
 
     Auth auth();
 
+    Langfuse langfuse();
+
+    Tracing tracing();
+
+    /** Langfuse export of the AI spans. Both keys unset means nothing is sent to Langfuse. */
+    interface Langfuse {
+        @WithDefault("https://us.cloud.langfuse.com")
+        String baseUrl();
+
+        Optional<String> publicKey();
+
+        Optional<String> secretKey();
+
+        /** Langfuse environment of every AI span: lowercase letters, digits, {@code -} and {@code _}. */
+        @WithDefault("default")
+        String environment();
+
+        @WithDefault("10s")
+        Duration timeout();
+    }
+
+    interface Tracing {
+        /**
+         * Record prompts, evidence, completions, questions, answers and tool results on AI spans. Unset means "when a
+         * Langfuse public key is set".
+         */
+        Optional<Boolean> captureContent();
+    }
+
     interface Upstream {
         String orderUrl();
 

@@ -5,7 +5,9 @@ import java.time.Clock;
 import java.util.ArrayList;
 import java.util.HexFormat;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 
 import jakarta.enterprise.context.ApplicationScoped;
@@ -22,6 +24,7 @@ import org.box1.aiops.model.ModelClient;
 import org.box1.aiops.model.ModelRequest;
 import org.box1.aiops.model.ModelResult;
 import org.box1.aiops.security.Guard;
+import org.box1.aiops.tracing.AiTracing;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 
@@ -30,8 +33,6 @@ import org.jboss.logging.MDC;
 import io.micrometer.core.instrument.MeterRegistry;
 import io.micrometer.core.instrument.Timer;
 import io.opentelemetry.api.trace.Span;
-import io.opentelemetry.api.trace.StatusCode;
-import io.opentelemetry.api.trace.Tracer;
 import io.opentelemetry.context.Context;
 import io.opentelemetry.context.Scope;
 import io.quarkus.logging.Log;
@@ -45,6 +46,8 @@ import io.quarkus.logging.Log;
 @ApplicationScoped
 public class AnalysisService {
     private static final SecureRandom RANDOM = new SecureRandom();
+    /** Trace and root span name: stable, it is what Langfuse filters, evaluators and dashboards match on. */
+    static final String TRACE = "analyze-incident";
     /** Read failures of an expected source. Service-declared gaps (UNAVAILABLE) do not degrade an analysis. */
     static final String UNSUPPORTED_SUMMARY = "No supported diagnosis: none of the model's findings cited "
         + "evidence that exists. Review the evidence directly.";
@@ -60,12 +63,12 @@ public class AnalysisService {
     private final AnalysisStore store;
     private final ModelGate gate;
     private final Clock clock = Clock.systemUTC();
-    private final Tracer tracer;
+    private final AiTracing tracing;
 
     @Inject
     public AnalysisService(Guard guard, Upstreams upstreams, EvidenceService evidence, ModelClient model,
-            ObjectMapper json, AiopsConfig config, MeterRegistry registry, Tracer tracer, ModelGate gate) {
-        this.tracer = tracer;
+            ObjectMapper json, AiopsConfig config, MeterRegistry registry, AiTracing tracing, ModelGate gate) {
+        this.tracing = tracing;
         this.guard = guard;
         this.upstreams = upstreams;
         this.evidence = evidence;
@@ -119,25 +122,57 @@ public class AnalysisService {
     /** Runs on a worker with the submitting request's trace context (review A-6, O-1). */
     private void run(Analysis queued, String subject) {
         Timer.Sample sample = Timer.start(registry);
-        Span span = tracer.spanBuilder("aiops.analysis").setAttribute("aiops.analysis_id", queued.analysisId())
-            .setAttribute("aiops.incident_id", queued.incidentId()).startSpan();
+        AiTracing.TraceInfo info = new AiTracing.TraceInfo(TRACE, subject, null, List.of("analysis"),
+            Map.of("analysis_id", queued.analysisId(), "incident_id", queued.incidentId(), "order_id",
+                queued.orderId(), "policy_version", Prompt.POLICY_VERSION, "context_profile",
+                config.model().contextProfile()));
+        Span span = tracing.startTrace(TRACE, AiTracing.Type.CHAIN, info);
+        span.setAttribute("aiops.analysis_id", queued.analysisId());
+        span.setAttribute("aiops.incident_id", queued.incidentId());
+        tracing.input(span, Map.of("incidentId", queued.incidentId(), "orderId", queued.orderId()));
         MDC.put("analysisId", queued.analysisId());
         Analysis result;
-        try (Scope ignored = span.makeCurrent()) {
+        try (Scope ignored = tracing.context(span, info).makeCurrent()) {
             store.put(queued.running(), subject);
             result = analyze(queued);
         } catch (RuntimeException e) {
             Log.errorf("analysis %s failed: %s at %s", queued.analysisId(), e.getClass().getSimpleName(), where(e));
-            span.setStatus(StatusCode.ERROR);
             result = finish(queued, null, Analysis.Status.FAILED, "internal error", List.of(), null, null, null);
         }
         store.put(result, subject);
         span.setAttribute("aiops.status", result.status().name());
+        record(span, result);
         span.end();
         sample.stop(registry.timer("aiops_analysis_duration_seconds", "status", result.status().name()));
         registry.counter("aiops_analyses_total", "status", result.status().name()).increment();
         Log.infof("analysis finished analysisId=%s status=%s", result.analysisId(), result.status());
         MDC.remove("analysisId");
+    }
+
+    /** The trace's output: status and service detail always; the model's summary and findings only as content. */
+    private void record(Span span, Analysis result) {
+        if (result.incidentType() != null) {
+            tracing.metadata(span, "incident_type", result.incidentType());
+        }
+        tracing.metadata(span, "status", result.status().name());
+        Map<String, Object> out = new LinkedHashMap<>();
+        out.put("status", result.status().name());
+        if (result.statusDetail() != null) {
+            out.put("detail", result.statusDetail());
+        }
+        if (tracing.capturesContent()) {
+            out.put("summary", result.summary());
+            out.put("findings", result.findings());
+            out.put("unknowns", result.unknowns());
+            out.put("suggestedActions", result.suggestedActions());
+        }
+        tracing.output(span, out);
+        switch (result.status()) {
+            case COMPLETED -> {
+            }
+            case DEGRADED -> tracing.level(span, AiTracing.Level.WARNING, result.statusDetail());
+            default -> tracing.level(span, AiTracing.Level.ERROR, result.statusDetail());
+        }
     }
 
     /** First org.box1 stack frame, for diagnosis without the message (which may contain evidence) (review O-4). */
@@ -152,7 +187,7 @@ public class AnalysisService {
 
     private Analysis analyze(Analysis queued) {
         Profile profile = Profile.of(config.model().contextProfile());
-        EvidenceService.Bundle bundle = evidence.gather(queued.orderId(), profile.evidenceBytes());
+        EvidenceService.Bundle bundle = gather(queued.orderId(), profile.evidenceBytes());
         List<EvidenceItem> items = bundle.items();
         String type = IncidentRules.derive(bundle.order(), config.analysis().stuckThreshold(), clock.instant());
         Long awaiting = IncidentRules.minutesAwaitingErp(bundle.order(), clock.instant());
@@ -193,11 +228,20 @@ public class AnalysisService {
         Set<String> refs = new HashSet<>();
         items.forEach(i -> refs.add(i.ref()));
         OutputValidator.Validated v;
+        Span check = tracing.start("validate-analysis", AiTracing.Type.EVALUATOR);
         try {
+            tracing.input(check, Map.of("knownRefs", new java.util.TreeSet<>(refs)));
             v = OutputValidator.validate(json, answer.content(), refs);
+            tracing.output(check, v.quality());
+            if (v.quality().unsupportedAssertions() > 0 || v.quality().droppedActions() > 0) {
+                tracing.level(check, AiTracing.Level.WARNING, "findings or actions were dropped");
+            }
         } catch (OutputValidator.Invalid e) {
+            tracing.level(check, AiTracing.Level.ERROR, e.getMessage());
             return finish(typed, items, Analysis.Status.MODEL_INVALID_OUTPUT, e.getMessage(), serviceUnknowns(items),
                 info, null, null);
+        } finally {
+            check.end();
         }
         boolean degraded = items.stream().anyMatch(i -> EvidenceService.CORE.contains(i.type())
             && DEGRADING.contains(i.retrievalStatus()));
@@ -213,6 +257,47 @@ public class AnalysisService {
         return new Analysis(typed.analysisId(), typed.incidentId(), typed.orderId(), type,
             degraded ? Analysis.Status.DEGRADED : Analysis.Status.COMPLETED, detail, typed.createdAt(),
             clock.instant(), summary, v.findings(), List.copyOf(unknowns), v.actions(), items, info, v.quality());
+    }
+
+    /** The read-only evidence lookups, as one retriever observation; evidence data is recorded only as content. */
+    private EvidenceService.Bundle gather(String orderId, int budgetBytes) {
+        Span span = tracing.start("gather-evidence", AiTracing.Type.RETRIEVER);
+        try (Scope ignored = span.makeCurrent()) {
+            tracing.input(span, Map.of("orderId", orderId, "budgetBytes", budgetBytes));
+            EvidenceService.Bundle bundle = evidence.gather(orderId, budgetBytes);
+            List<Map<String, Object>> out = new ArrayList<>();
+            for (EvidenceItem i : bundle.items()) {
+                Map<String, Object> item = new LinkedHashMap<>();
+                item.put("ref", i.ref());
+                item.put("type", i.type());
+                item.put("source", i.source());
+                item.put("retrievalStatus", i.retrievalStatus());
+                if (i.detail() != null) {
+                    item.put("detail", i.detail());
+                }
+                if (i.truncated()) {
+                    item.put("truncated", true);
+                }
+                if (tracing.capturesContent() && i.data() != null) {
+                    item.put("data", i.data());
+                }
+                out.add(item);
+            }
+            tracing.output(span, out);
+            // Service-declared gaps (UNAVAILABLE, e.g. a source not configured) are expected; read failures are not.
+            long failed = bundle.items().stream().filter(i -> DEGRADING.contains(i.retrievalStatus())).count();
+            tracing.metadata(span, "items", bundle.items().size());
+            tracing.metadata(span, "not_ok", bundle.items().stream().filter(i -> !i.ok()).count());
+            tracing.metadata(span, "read_failures", failed);
+            if (bundle.order() == null) {
+                tracing.level(span, AiTracing.Level.ERROR, "order evidence unavailable (" + bundle.orderStatus() + ")");
+            } else if (failed > 0) {
+                tracing.level(span, AiTracing.Level.WARNING, failed + " evidence read(s) failed");
+            }
+            return bundle;
+        } finally {
+            span.end();
+        }
     }
 
     private Analysis finish(Analysis base, List<EvidenceItem> items, Analysis.Status status, String detail,

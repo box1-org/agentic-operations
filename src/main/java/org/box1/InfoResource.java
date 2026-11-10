@@ -25,6 +25,11 @@ public class InfoResource {
         return new ApplicationInfo("agentic-operations", version, Runtime.version().feature(), "tekton-gitops", GIT_REF);
     }
 
+    /** The source revision this build was made from, or {@code unknown}. */
+    public static String gitRef() {
+        return GIT_REF;
+    }
+
     private static String readGitRef() {
         try (InputStream input = InfoResource.class.getResourceAsStream("/META-INF/box1-build.properties")) {
             if (input == null) {

@@ -110,6 +110,7 @@ Each step records `tool`, `target` (a validated ID only), `decision` (`ok`, `inv
     - Answers are model text and can be wrong; the console labels them so.
   - Output must match the schema. Findings without valid citations, and actions outside the allowlist, are dropped and counted. If every finding is dropped, the model's summary is replaced with a fixed "no supported diagnosis" text.
 - **Logs:** prompts, completions, chat questions and answers, evidence and reasoning output are never logged. Logs carry IDs, outcomes, token counts and durations. The audit log records a caller-supplied ID only when it has a known shape.
+- **AI traces:** prompts, sanitized evidence, completions, questions, answers and tool results are recorded on the AI spans only when content capture is on (`AIOPS_TRACE_CONTENT`; by default, when a Langfuse key is set). The content then goes to Langfuse and also to the OpenTelemetry collector. Without content capture, AI spans carry only IDs, types, statuses, the model, token counts and service-written details. Span status messages are always service-written, never model or upstream text.
 - **Upstream reads:** each has one overall deadline covering headers and body, and the body is capped. A stalled upstream ends as `TIMEOUT`.
 - **Customers:** v1 is operator-only; box1 has no customer identity.
 
@@ -130,6 +131,10 @@ Each step records `tool`, `target` (a validated ID only), `decision` (`ok`, `inv
 | `AIOPS_TEMPO_URL`, `AIOPS_LOKI_URL`, `AIOPS_THANOS_TENANCY_URL`, `AIOPS_ALERTMANAGER_TENANCY_URL` | unset | Tempo gateway (tenant `dev`), LokiStack gateway (tenant `application`), Thanos querier tenancy port 9092 and Alertmanager tenancy port 9095 |
 | `AIOPS_PLATFORM_ORDER_NAMESPACES` | order, inventory and fulfillment-adapter `-dev` | The namespaces whose logs and alerts an order's evidence covers. Never taken from callers or the model |
 | `AIOPS_ANALYSIS_*`, `AIOPS_WINDOW_*` | see `AiopsConfig` | Cache size and TTL (200, 24h), concurrency 1, queue 4, window age 6h, 20,000 events, 200 per key |
+| `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY` | unset | Langfuse project key pair. With both set, AI spans also go to Langfuse. Unset means nothing is sent there. Mount them from a Secret |
+| `LANGFUSE_BASE_URL` | `https://us.cloud.langfuse.com` | Langfuse host (US cloud, EU `https://cloud.langfuse.com`, or self-hosted) |
+| `LANGFUSE_TRACING_ENVIRONMENT` | `default` (`development` in dev mode, `test` in tests) | Langfuse environment of every AI trace, for example `dev` or `production`. Lowercase letters, digits, `-` and `_` |
+| `AIOPS_TRACE_CONTENT` | unset: on when a Langfuse key is set | `true` or `false`: record prompts, evidence, completions, questions, answers and tool results on AI spans |
 
 ### Model client
 
@@ -139,6 +144,22 @@ Each step records `tool`, `target` (a validated ID only), `decision` (`ok`, `inv
 - **Request settings:** retries are off, request and response logging is off, and reasoning output is not returned. Every request sets `temperature 0` and `chat_template_kwargs.enable_thinking=false`. Analyses use strict `json_schema` output.
 - **Tool schemas:** these are sent without `additionalProperties`, because LangChain4j adds it only for strict tools. Strict tools would make every parameter required, and `search_logs` takes either `orderId` or `traceId`. `ChatTools` reads only the keys it knows and validates each value.
 - **Live check:** `AIOPS_LIVE_MODEL_URL=https://<vllm-route>/v1 ./mvnw test -Dtest=LiveModelTest` runs both calls against a real vLLM endpoint with the production prompts and schemas. It is skipped when the variable is unset.
+
+### AI tracing and Langfuse
+
+The AI work is traced with OpenTelemetry in the shape Langfuse expects ([best practices](https://langfuse.com/docs/observability/best-practices)), in `org.box1.aiops.tracing`. `AiTracing` creates the spans, `TracedModelClient` records each model call, and `LangfuseExport` sends AI spans to Langfuse.
+
+| Trace (`langfuse.trace.name`) | Observations, by type | Session, user and tags |
+|---|---|---|
+| `analyze-incident`: one per analysis. Input is the incident and order IDs; output is the status, summary, findings, unknowns and suggested actions | `analyze-incident` (chain), containing `gather-evidence` (retriever), `generate-analysis` (generation) and `validate-analysis` (evaluator) | User is the caller. Tag `analysis` |
+| `answer-message`: one per Assistant message. Input is the question; output is the answer | `answer-message` (agent), containing one `generate-reply` (generation) per model round and one retriever per tool call, named after the tool | Session is the conversation ID. User is the caller. Tag `assistant` |
+
+- **Generations:** each one records the model, `temperature` and `max_tokens`, token usage and finish reason. With content capture, its input is the exact message list sent, in OpenAI shape (tool call arguments as JSON strings, tool results with their `tool_call_id`), and its output is the assistant message. A failed model call is an `ERROR` observation with the service-written detail.
+- **Trace attributes:** trace name, user, session, tags, `langfuse.release` (the build's git revision), `langfuse.environment` and metadata are set on every AI span. Metadata includes the analysis, incident, order, conversation and turn IDs, and the policy version. These attributes are set from the OpenTelemetry context, not baggage, so none of them leave the service in request headers.
+- **Export:** `LangfuseExport` is an extra span processor. It sends OTLP/HTTP to `<LANGFUSE_BASE_URL>/api/public/otel/v1/traces` with Basic auth and `x-langfuse-ingestion-version: 4`. Only AI spans are sent: HTTP, Kafka and upstream spans stay in the collector. The collector still receives every span, and an AI trace's root stays under the submitting request there. In Langfuse that root is the trace root, with the same trace ID, so a Langfuse trace can be found in Tempo by its ID.
+- **Why no `quarkus-langfuse` extension:** version 0.9.1 hung this build in bean discovery (over 10 minutes), and it requires Langfuse keys for the app to start.
+- **Cost:** `box1-coder` has no Langfuse price, so traces show tokens but no cost. To get cost, add a custom model definition in Langfuse.
+- **Live check:** run `AIOPS_LIVE_MODEL_URL=https://<vllm-route>/v1 AIOPS_LIVE_LANGFUSE=true LANGFUSE_PUBLIC_KEY=… LANGFUSE_SECRET_KEY=… ./mvnw test -Dtest=LiveLangfuseTest`. It runs one analysis and a two-message conversation through the REST API (with the fake upstreams) and flushes the spans. The traces are in environment `test`.
 
 ## Kafka evidence window
 
@@ -171,7 +192,7 @@ Each step records `tool`, `target` (a validated ID only), `decision` (`ok`, `inv
 - **Busy (429):** one model job runs at a time, matching vLLM `--max-num-seqs 1`. Analyses and Assistant messages share the queue of 4, and a message holds the slot for its whole tool loop (90 s at most). Raise `AIOPS_ANALYSIS_CONCURRENCY` only together with vLLM.
 - **Empty window after a restart:** expected while the consumer re-reads the last 6h from every partition. The refill time has not been measured yet. `aiops_window_oldest_age_seconds` grows as the window refills. If it stays at 0, check the Kafka bootstrap address, consumer group membership and `aiops_window_seek_failures_total`.
 - **Shutdown:** queued and running analyses and chat messages are abandoned (in memory, by design). They are logged and counted as `aiops_model_work_abandoned_total`.
-- **Tracing:** each chat message runs in an `aiops.chat.turn` span, with one `aiops.chat.tool` span per read. Each analysis runs in an `aiops.analysis` span with the `aiops.analysis_id` attribute, under the submitting request's trace. Upstream and model calls carry W3C `traceparent`. Worker logs carry `analysisId` in MDC.
+- **Tracing:** each chat message runs in an `answer-message` span, with one span per tool read, named after the tool and carrying the `aiops.tool` attribute. Each analysis runs in an `analyze-incident` span with the `aiops.analysis_id` attribute, under the submitting request's trace. Langfuse receives these spans too when configured (see [AI tracing and Langfuse](#ai-tracing-and-langfuse)). Upstream and model calls carry W3C `traceparent`. Worker logs carry `analysisId` in MDC.
 - **Lost analyses after a restart:** expected (in-memory, single replica). Re-run the analysis. Durable state is box1-docs#97.
 - **Rollback:** promote the previous image digest through box1-workloads-dev. The service keeps no state.
 
